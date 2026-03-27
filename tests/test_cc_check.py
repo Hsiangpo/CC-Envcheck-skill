@@ -446,5 +446,47 @@ class TestFixLocalWindowsSafety(unittest.TestCase):
             self.assertIn("Removed Claude telemetry", actions)
 
 
+class TestClashVergeDnsToggleSafety(unittest.TestCase):
+    """验证 Clash Verge DNS 设置修复不会误伤工作链路。"""
+
+    def test_runtime_with_domain_proxies_is_detected(self):
+        runtime = "proxies:\n- name: test\n  server: cc.gpteamservices.com\n  port: 8388\n"
+        self.assertTrue(cc_check.runtime_has_domain_proxies(runtime))
+
+    def test_runtime_with_ip_proxies_is_not_detected(self):
+        runtime = "proxies:\n- name: test\n  server: 104.254.211.203\n  port: 8388\n"
+        self.assertFalse(cc_check.runtime_has_domain_proxies(runtime))
+
+    @patch.object(cc_check.plat, "PLATFORM", "darwin")
+    def test_skip_dns_toggle_on_macos_when_runtime_uses_domain_proxies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clash_dir = Path(tmpdir)
+            (clash_dir / "verge.yaml").write_text("enable_dns_settings: true\n", encoding="utf-8")
+            (clash_dir / "clash-verge.yaml").write_text(
+                "proxies:\n- name: test\n  server: cc.gpteamservices.com\n  port: 8388\n",
+                encoding="utf-8",
+            )
+
+            changed = cc_check.ensure_verge_dns_toggle(clash_dir)
+
+            self.assertFalse(changed)
+            self.assertIn("enable_dns_settings: true", (clash_dir / "verge.yaml").read_text(encoding="utf-8"))
+
+    @patch.object(cc_check.plat, "PLATFORM", "win32")
+    def test_allow_dns_toggle_when_runtime_uses_ip_proxies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            clash_dir = Path(tmpdir)
+            (clash_dir / "verge.yaml").write_text("enable_dns_settings: true\n", encoding="utf-8")
+            (clash_dir / "clash-verge.yaml").write_text(
+                "proxies:\n- name: test\n  server: 104.254.211.203\n  port: 8388\n",
+                encoding="utf-8",
+            )
+
+            changed = cc_check.ensure_verge_dns_toggle(clash_dir)
+
+            self.assertTrue(changed)
+            self.assertIn("enable_dns_settings: false", (clash_dir / "verge.yaml").read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

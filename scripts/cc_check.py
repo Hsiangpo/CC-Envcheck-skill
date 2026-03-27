@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -608,17 +609,45 @@ def upsert_env_block(path: Path, targets: dict[str, str | None], dry_run: bool =
     return None
 
 
-def ensure_verge_dns_toggle(clash_dir: Path) -> None:
-    """确保 Clash Verge 的 DNS 设置开关关闭。"""
+def _is_ip_literal(value: str) -> bool:
+    """判断字符串是否为 IP 字面量。"""
+    candidate = value.strip().strip('"').strip("'").strip("[]")
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        return False
+
+
+def runtime_has_domain_proxies(runtime_text: str) -> bool:
+    """检查运行时配置里是否存在域名型代理节点。"""
+    for match in re.finditer(r"^\s*server:\s*([^\s#]+)", runtime_text, re.MULTILINE):
+        server = match.group(1).strip().strip('"').strip("'")
+        if server and not _is_ip_literal(server) and server.lower() != "localhost":
+            return True
+    return False
+
+
+def ensure_verge_dns_toggle(clash_dir: Path) -> bool:
+    """在安全前提下关闭 Clash Verge 的 DNS 设置开关。"""
     verge_yaml = clash_dir / "verge.yaml"
     if not verge_yaml.exists():
-        return
+        return False
+
+    runtime = clash_dir / "clash-verge.yaml"
+    runtime_text = runtime.read_text(encoding="utf-8", errors="ignore") if runtime.exists() else ""
+
+    # macOS 上如果运行时代理节点使用域名，强关 DNS 设置可能打断代理链路。
+    if plat.PLATFORM == "darwin" and runtime_has_domain_proxies(runtime_text):
+        return False
+
     text = verge_yaml.read_text(encoding="utf-8", errors="ignore")
     if "enable_dns_settings:" in text:
         text = re.sub(r"enable_dns_settings:\s*.*", "enable_dns_settings: false", text)
     else:
         text += "\nenable_dns_settings: false\n"
     verge_yaml.write_text(text, encoding="utf-8")
+    return True
 
 
 def redact_text(text: str, tokens: list[str]) -> str:
@@ -675,10 +704,17 @@ def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
     # Clash Verge DNS toggle
     if ctx.clash_dir is not None and has_failure(findings, {"system-dns-display"}):
         if ctx.dry_run:
-            actions.append("[DRY RUN] Would set Clash Verge enable_dns_settings to false")
+            runtime = ctx.clash_dir / "clash-verge.yaml"
+            runtime_text = runtime.read_text(encoding="utf-8", errors="ignore") if runtime.exists() else ""
+            if plat.PLATFORM == "darwin" and runtime_has_domain_proxies(runtime_text):
+                actions.append("[DRY RUN] Would skip Clash Verge DNS toggle because runtime proxies use domains")
+            else:
+                actions.append("[DRY RUN] Would set Clash Verge enable_dns_settings to false")
         else:
-            ensure_verge_dns_toggle(ctx.clash_dir)
-            actions.append("Set Clash Verge enable_dns_settings to false")
+            if ensure_verge_dns_toggle(ctx.clash_dir):
+                actions.append("Set Clash Verge enable_dns_settings to false")
+            else:
+                actions.append("Skipped Clash Verge DNS toggle to avoid breaking domain-based proxies")
 
     # DNS display
     if has_failure(findings, {"system-dns-display"}):
