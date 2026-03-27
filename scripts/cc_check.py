@@ -908,14 +908,14 @@ def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
             for path, count in removed.items():
                 actions.append(f"Removed {count} China-domain lines from {path} (backup: {path}.bak)")
 
-    # Input method: advise on RIME/Squirrel if Chinese IME detected
+    # Input method: install RIME and remove system Chinese IME
     if any(f.key == "input-method" and f.status == "warn" for f in findings):
-        actions.append(
-            "💡 Input method tip: Install RIME/Squirrel (鼠须管) — "
-            "same Pinyin experience, but bundle ID 'im.rime.inputmethod.Squirrel' "
-            "does not contain 'Pinyin' or 'Chinese' keywords. "
-            "Install: brew install --cask squirrel"
-        )
+        if ctx.dry_run:
+            actions.extend(plat.install_rime(dry_run=True))
+            actions.extend(plat.remove_system_chinese_ime(dry_run=True))
+        else:
+            actions.extend(plat.install_rime(dry_run=False))
+            actions.extend(plat.remove_system_chinese_ime(dry_run=False))
 
     return actions or ["No local repairs needed"]
 

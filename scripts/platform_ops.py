@@ -272,6 +272,170 @@ def get_active_input_methods() -> list[str]:
     return methods
 
 
+def install_rime(dry_run: bool = False) -> list[str]:
+    """跨平台安装 RIME 输入法（隐蔽中文输入方案）。
+
+    macOS: Squirrel (鼠须管) — bundle ID: im.rime.inputmethod.Squirrel
+    Linux: ibus-rime 或 fcitx5-rime
+    Windows: Weasel (小狼毫)
+
+    Returns:
+        list[str]: 操作日志
+    """
+    actions: list[str] = []
+
+    if PLATFORM == "darwin":
+        # Check if already installed
+        if Path("/Library/Input Methods/Squirrel.app").exists():
+            actions.append("RIME/Squirrel already installed")
+            return actions
+
+        if dry_run:
+            actions.append("[DRY RUN] Would download and install Squirrel.pkg from GitHub")
+            return actions
+
+        # Download latest release
+        import json as _json
+        try:
+            from urllib.request import urlopen
+            resp = urlopen("https://api.github.com/repos/rime/squirrel/releases/latest", timeout=15)
+            release = _json.loads(resp.read())
+            pkg_url = None
+            for asset in release.get("assets", []):
+                if asset["name"].endswith(".pkg"):
+                    pkg_url = asset["browser_download_url"]
+                    break
+            if not pkg_url:
+                actions.append("Failed: no .pkg found in latest Squirrel release")
+                return actions
+
+            pkg_path = Path("/tmp/Squirrel.pkg")
+            r = run_shell(f'curl -sL -o {pkg_path} "{pkg_url}"')
+            if r.returncode != 0 or not pkg_path.exists():
+                actions.append("Failed to download Squirrel.pkg")
+                return actions
+            actions.append(f"Downloaded Squirrel.pkg ({pkg_path.stat().st_size // 1024 // 1024}MB)")
+
+            # Install (requires sudo - will prompt)
+            r = run_shell(f"sudo installer -pkg {pkg_path} -target /")
+            if r.returncode == 0:
+                actions.append("Installed Squirrel successfully")
+            else:
+                actions.append(f"Install failed (may need manual: open {pkg_path})")
+                actions.append("Manual install: double-click /tmp/Squirrel.pkg")
+        except Exception as e:
+            actions.append(f"Failed to install Squirrel: {e}")
+            actions.append("Manual: download from https://github.com/rime/squirrel/releases")
+
+    elif PLATFORM == "linux":
+        if dry_run:
+            actions.append("[DRY RUN] Would install ibus-rime or fcitx5-rime")
+            return actions
+
+        # Detect package manager and input framework
+        has_fcitx5 = run_shell("which fcitx5 2>/dev/null").returncode == 0
+        has_ibus = run_shell("which ibus 2>/dev/null").returncode == 0
+        has_apt = run_shell("which apt-get 2>/dev/null").returncode == 0
+        has_dnf = run_shell("which dnf 2>/dev/null").returncode == 0
+        has_pacman = run_shell("which pacman 2>/dev/null").returncode == 0
+
+        pkg = "fcitx5-rime" if has_fcitx5 else "ibus-rime"
+
+        if has_apt:
+            r = run_shell(f"sudo apt-get install -y {pkg}")
+        elif has_dnf:
+            r = run_shell(f"sudo dnf install -y {pkg}")
+        elif has_pacman:
+            r = run_shell(f"sudo pacman -S --noconfirm {pkg}")
+        else:
+            actions.append(f"Please install {pkg} manually with your package manager")
+            return actions
+
+        if r.returncode == 0:
+            actions.append(f"Installed {pkg} successfully")
+        else:
+            actions.append(f"Failed to install {pkg}: {r.stderr}")
+
+    elif PLATFORM == "win32":
+        if dry_run:
+            actions.append("[DRY RUN] Would download Weasel (小狼毫) installer")
+            return actions
+
+        actions.append("Windows RIME (Weasel/小狼毫) requires manual installation:")
+        actions.append("  Download: https://github.com/rime/weasel/releases")
+        actions.append("  After install, remove Chinese IME from Settings → Time & Language → Language")
+
+    return actions
+
+
+def remove_system_chinese_ime(dry_run: bool = False) -> list[str]:
+    """移除系统内置的中文输入法（保留 RIME）。
+
+    Returns:
+        list[str]: 操作日志
+    """
+    actions: list[str] = []
+
+    if PLATFORM == "darwin":
+        try:
+            import plistlib
+            plist_path = Path.home() / "Library/Preferences/com.apple.HIToolbox.plist"
+            if not plist_path.exists():
+                return ["HIToolbox plist not found"]
+
+            payload = plistlib.loads(plist_path.read_bytes())
+            china_keywords = ("pinyin", "chinese", "wubi", "shuangpin", "zhuyin",
+                              "cangjie", "changjie", "scim", "itabc")
+
+            for key in ("AppleEnabledInputSources", "AppleSelectedInputSources"):
+                sources = payload.get(key, [])
+                cleaned = []
+                for src in sources:
+                    if not isinstance(src, dict):
+                        cleaned.append(src)
+                        continue
+                    # Combine all identifying fields for matching
+                    all_ids = " ".join(str(v) for v in [
+                        src.get("Input Mode", ""),
+                        src.get("Bundle ID", ""),
+                        src.get("KeyboardLayout Name", ""),
+                    ]).lower()
+                    # Keep RIME, remove system Chinese
+                    if "rime" in all_ids:
+                        cleaned.append(src)
+                    elif any(kw in all_ids for kw in china_keywords):
+                        label = src.get("Input Mode") or src.get("Bundle ID") or "unknown"
+                        actions.append(f"{'[DRY RUN] Would remove' if dry_run else 'Removed'}: {label}")
+                    else:
+                        cleaned.append(src)
+                payload[key] = cleaned
+
+            if not dry_run and actions:
+                plist_path.write_bytes(plistlib.dumps(payload))
+                actions.append("Updated HIToolbox.plist — changes take effect after logout/restart")
+
+        except Exception as e:
+            actions.append(f"Failed to modify input sources: {e}")
+
+    elif PLATFORM == "linux":
+        if dry_run:
+            actions.append("[DRY RUN] Would remove system Chinese IME from input sources")
+        else:
+            actions.append("Linux: Remove Chinese IME via Settings → Region & Language → Input Sources")
+            actions.append("Keep only RIME after installing ibus-rime or fcitx5-rime")
+
+    elif PLATFORM == "win32":
+        if dry_run:
+            actions.append("[DRY RUN] Would remove Microsoft Pinyin from language settings")
+        else:
+            # Try PowerShell removal
+            r = run_shell('powershell -Command "Get-WinUserLanguageList"')
+            actions.append("Windows: Remove Chinese IME from Settings → Time & Language → Language & Region")
+            actions.append("Keep only Weasel after installing RIME")
+
+    return actions or ["No system Chinese IME to remove"]
+
+
 # ---------------------------------------------------------------------------
 # DNS
 # ---------------------------------------------------------------------------
