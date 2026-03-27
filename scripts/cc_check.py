@@ -577,6 +577,82 @@ def inspect_privacy(ctx: Context) -> list[Finding]:
     return findings
 
 
+def inspect_extended() -> list[Finding]:
+    """扩展检查：包管理镜像、开发工具指纹、SSH 残留、字体指纹。"""
+    findings: list[Finding] = []
+
+    # GOPROXY
+    goproxy = plat.check_goproxy()
+    if goproxy["installed"]:
+        if goproxy["china"]:
+            findings.append(Finding("packages", "goproxy", "fail",
+                                    f"GOPROXY → China mirror: {goproxy['proxy']}"))
+        else:
+            findings.append(Finding("packages", "goproxy", "pass",
+                                    f"GOPROXY clean: {goproxy['proxy']}"))
+    else:
+        findings.append(Finding("packages", "goproxy", "skip", "Go not installed"))
+
+    # Docker mirrors
+    docker = plat.check_docker_mirrors()
+    if docker["found"]:
+        if docker["china"]:
+            findings.append(Finding("packages", "docker-mirror", "fail",
+                                    f"Docker China mirrors in {docker.get('path', 'daemon.json')}",
+                                    docker["mirrors"][:5]))
+        else:
+            findings.append(Finding("packages", "docker-mirror", "pass",
+                                    "Docker mirrors configured (non-China)"))
+    else:
+        findings.append(Finding("packages", "docker-mirror", "pass",
+                                "No Docker mirror config found"))
+
+    # Git remotes
+    china_remotes = plat.scan_git_remotes()
+    if china_remotes:
+        findings.append(Finding("identity", "git-remotes", "warn",
+                                f"{len(china_remotes)} China Git host(s) found",
+                                china_remotes[:10]))
+    else:
+        findings.append(Finding("identity", "git-remotes", "pass",
+                                "No China Git hosts in local repos"))
+
+    # VS Code locale
+    vscode = plat.check_vscode_locale()
+    if vscode["found"]:
+        if vscode["china"]:
+            findings.append(Finding("system", "vscode-locale", "fail",
+                                    f"VS Code locale: {vscode['locale']} ({vscode.get('path', '')})"))
+        else:
+            findings.append(Finding("system", "vscode-locale", "pass",
+                                    f"VS Code locale: {vscode['locale']}"))
+    else:
+        findings.append(Finding("system", "vscode-locale", "pass",
+                                "VS Code locale not set (default English)"))
+
+    # SSH known_hosts
+    ssh_hits = plat.scan_ssh_known_hosts()
+    if ssh_hits:
+        findings.append(Finding("privacy", "ssh-known-hosts", "warn",
+                                f"{len(ssh_hits)} China IP/domain(s) in known_hosts",
+                                ssh_hits[:10]))
+    else:
+        findings.append(Finding("privacy", "ssh-known-hosts", "pass",
+                                "SSH known_hosts clean"))
+
+    # Font fingerprints
+    fonts = plat.check_system_fonts()
+    if fonts["total_cjk"] > 0:
+        findings.append(Finding("system", "font-fingerprint", "warn",
+                                f"{fonts['total_cjk']} non-bundled Chinese font(s) detected",
+                                fonts["china_fonts"]))
+    else:
+        findings.append(Finding("system", "font-fingerprint", "pass",
+                                "No non-bundled Chinese fonts detected"))
+
+    return findings
+
+
 def inspect_identity() -> list[Finding]:
     findings: list[Finding] = []
     name = plat.get_git_global_value("user.name")
@@ -685,6 +761,7 @@ def collect_findings(ctx: Context, include_vpn: bool = True) -> list[Finding]:
     findings.extend(inspect_packages())
     findings.extend(inspect_privacy(ctx))
     findings.extend(inspect_identity())
+    findings.extend(inspect_extended())
     findings.extend(inspect_clash(ctx, public_ip))
     findings.extend(inspect_claude(ctx))
     if include_vpn:
