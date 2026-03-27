@@ -6,6 +6,7 @@ This file groups the audit surface that `CC-check` should cover.
 
 - Public egress IP
 - IP geo alignment
+- IP quality classification from multiple reputable channels
 - DNS actual path
 - DNS display path
 - proxy env vars
@@ -52,12 +53,12 @@ This file groups the audit surface that `CC-check` should cover.
 - runtime config contains expected `hosts`
 - system DNS display cleanup watchdog installed
 
-## GPTeam VPN project
+## VPN project and remote state
 
 - detected VPN repo exists
 - unit tests pass
 - generated subscription contains the hardened DNS/TUN config
 - public subscription matches hardened output
 - deploy script points to the active host and expected SSH port
-- remote `gpteam-ss` is active
+- remote VPN service is active
 - remote `8388` is owned by Xray, not legacy `ss-server`

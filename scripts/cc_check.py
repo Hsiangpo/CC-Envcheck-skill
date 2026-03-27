@@ -24,36 +24,21 @@ try:
 except Exception:  # pragma: no cover - 依赖缺失时降级
     paramiko = None
 
+from ip_quality import assess_ip_quality
+
 
 ENV_BLOCK_START = "# >>> cc-check env >>>"
 ENV_BLOCK_END = "# <<< cc-check env <<<"
-ENV_BLOCK = """# >>> cc-check env >>>
-export TZ="America/Los_Angeles"
-export LANG="en_US.UTF-8"
-export LC_ALL="en_US.UTF-8"
-export LANGUAGE="en_US"
-export HTTP_PROXY="http://127.0.0.1:7897"
-export HTTPS_PROXY="$HTTP_PROXY"
-export http_proxy="$HTTP_PROXY"
-export https_proxy="$HTTP_PROXY"
-export ALL_PROXY="$HTTP_PROXY"
-export all_proxy="$HTTP_PROXY"
-export DISABLE_TELEMETRY="1"
-export DISABLE_ERROR_REPORTING="1"
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"
-# <<< cc-check env <<<"""
-
 SUSPICIOUS_DNS = {
     "114.114.114.114",
     "223.5.5.5",
     "223.6.6.6",
     "119.29.29.29",
 }
-PUBLIC_MARKERS = [
+GENERIC_PUBLIC_MARKERS = [
     "dns-hijack",
     "respect-rules: true",
     "proxy-server-nameserver",
-    "cc.gpteamservices.com",
 ]
 LOW_RISK_GOOGLE_MARKERS = (
     "2400:cb00:",
@@ -81,6 +66,11 @@ class Context:
     clash_dir: Path | None
     vpn_root: Path | None
     public_subscription_url: str | None
+    target_timezone: str | None
+    target_locale: str | None
+    target_language: str | None
+    proxy_url: str | None
+    expected_ip_type: str
 
 
 @dataclass
@@ -146,19 +136,22 @@ def detect_vpn_root(explicit: str | None) -> Path | None:
         candidates.append(Path(env_path).expanduser())
 
     home = Path.home()
-    candidates.extend(
-        [
-            home / "Develop" / "Masterpiece" / "System" / "My_VPN",
-            home / "Develop" / "My_VPN",
-            home / "Projects" / "My_VPN",
-            home / "Code" / "My_VPN",
-            home / "My_VPN",
-        ]
-    )
+    candidates.extend([home / "Develop", home / "Projects", home / "Code", home])
 
     for candidate in candidates:
-        if (candidate / "scripts" / "subscription_builder.py").exists():
+        if candidate.is_file():
+            continue
+        direct = candidate / "scripts" / "subscription_builder.py"
+        if direct.exists():
             return candidate
+        try:
+            for match in candidate.glob("**/scripts/subscription_builder.py"):
+                parts = match.parts
+                if ".git" in parts:
+                    continue
+                return match.parents[1]
+        except Exception:
+            continue
     return None
 
 
@@ -223,15 +216,28 @@ def make_context(args: argparse.Namespace) -> Context:
         clash_dir=clash_dir,
         vpn_root=vpn_root,
         public_subscription_url=public_subscription_url,
+        target_timezone=args.target_timezone,
+        target_locale=args.target_locale,
+        target_language=args.target_language,
+        proxy_url=args.proxy_url or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"),
+        expected_ip_type=args.expected_ip_type,
     )
 
 
-def profile_has_expected_env(path: Path) -> bool:
-    """检查 profile 是否已有环境块。"""
+def profile_has_expected_env(path: Path, targets: dict[str, str | None]) -> bool:
+    """检查 profile 是否包含目标环境块。"""
     if not path.exists():
         return False
     text = path.read_text(encoding="utf-8", errors="ignore")
-    return all(token in text for token in ('TZ="America/Los_Angeles"', 'LANG="en_US.UTF-8"', 'HTTP_PROXY="http://127.0.0.1:7897"'))
+    expected_tokens = [
+        f'TZ="{targets["timezone"]}"' if targets.get("timezone") else "",
+        f'LANG="{targets["locale"]}"' if targets.get("locale") else "",
+        f'HTTP_PROXY="{targets["proxy_url"]}"' if targets.get("proxy_url") else "",
+        'DISABLE_TELEMETRY="1"',
+        'DISABLE_ERROR_REPORTING="1"',
+        'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"',
+    ]
+    return all(token in text for token in expected_tokens if token)
 
 
 def get_dns_servers(service: str) -> list[str]:
@@ -266,6 +272,19 @@ def fetch_public_ip() -> str | None:
                 value = response.read().decode("utf-8", errors="ignore").strip()
                 if value:
                     return value
+        except (URLError, TimeoutError, socket.timeout, OSError):
+            continue
+    return None
+
+
+def fetch_text_url(url: str, timeout: int = 12, retries: int = 2) -> str | None:
+    """读取文本接口并做简单重试。"""
+    for _ in range(retries):
+        try:
+            with urlopen(url, timeout=timeout) as response:
+                text = response.read().decode("utf-8", errors="ignore")
+                if text:
+                    return text
         except (URLError, TimeoutError, socket.timeout, OSError):
             continue
     return None
@@ -319,6 +338,34 @@ def classify_google_dns(lines: list[str]) -> tuple[str, str]:
     return "pass", f"Google DNS whoami looks acceptable: {text}"
 
 
+def build_target_profile(
+    context: Context,
+    public_ip: str | None,
+    ip_quality: dict[str, Any] | None = None,
+) -> dict[str, str | None]:
+    """构建目标环境配置。"""
+    profile: dict[str, str | None] = {
+        "timezone": context.target_timezone,
+        "locale": context.target_locale,
+        "language": context.target_language,
+        "proxy_url": context.proxy_url,
+    }
+    if public_ip:
+        quality = ip_quality or assess_ip_quality(public_ip, context.expected_ip_type)
+        if not profile["timezone"]:
+            profile["timezone"] = quality.get("target_timezone")
+        if not profile["locale"]:
+            profile["locale"] = quality.get("target_locale")
+        if not profile["language"]:
+            profile["language"] = quality.get("target_language")
+    if not profile["proxy_url"]:
+        configs = get_clash_json("configs")
+        mixed_port = configs.get("mixed-port") if isinstance(configs, dict) else None
+        if mixed_port:
+            profile["proxy_url"] = f"http://127.0.0.1:{mixed_port}"
+    return profile
+
+
 def inspect_claude(context: Context) -> list[Finding]:
     """检查 Claude 相关配置。"""
     findings: list[Finding] = []
@@ -355,32 +402,80 @@ def inspect_claude(context: Context) -> list[Finding]:
     return findings
 
 
-def inspect_system(context: Context) -> list[Finding]:
+def inspect_system(context: Context, targets: dict[str, str | None]) -> list[Finding]:
     """检查系统环境。"""
     findings: list[Finding] = []
-    tz_ok = os.environ.get("TZ") == "America/Los_Angeles"
-    lang_ok = os.environ.get("LANG") == "en_US.UTF-8"
-    lc_all_ok = os.environ.get("LC_ALL") == "en_US.UTF-8"
-    zprofile_ok = profile_has_expected_env(context.home / ".zprofile")
-    zshrc_ok = profile_has_expected_env(context.home / ".zshrc")
+    timezone = targets.get("timezone")
+    locale = targets.get("locale")
+    proxy_url = targets.get("proxy_url")
+    zprofile_ok = profile_has_expected_env(context.home / ".zprofile", targets)
+    zshrc_ok = profile_has_expected_env(context.home / ".zshrc", targets)
 
-    if tz_ok and lang_ok and lc_all_ok and zprofile_ok and zshrc_ok:
-        findings.append(Finding("system", "locale-timezone", "pass", "Timezone and locale are aligned"))
+    if timezone:
+        tz_ok = os.environ.get("TZ") == timezone
+        if tz_ok and zprofile_ok and zshrc_ok:
+            findings.append(Finding("system", "timezone", "pass", f"Timezone is aligned to {timezone}"))
+        else:
+            findings.append(
+                Finding(
+                    "system",
+                    "timezone",
+                    "fail",
+                    f"Timezone is not aligned to {timezone}",
+                    details=[
+                        f"TZ={os.environ.get('TZ', '')}",
+                        f".zprofile={'ok' if zprofile_ok else 'missing'}",
+                        f".zshrc={'ok' if zshrc_ok else 'missing'}",
+                    ],
+                )
+            )
+    else:
+        findings.append(Finding("system", "timezone", "warn", "Target timezone is unknown; pass --target-timezone to enforce"))
+
+    if locale:
+        lang_ok = os.environ.get("LANG") == locale
+        lc_all_ok = os.environ.get("LC_ALL") == locale
+        if lang_ok and lc_all_ok and zprofile_ok and zshrc_ok:
+            findings.append(Finding("system", "locale", "pass", f"Locale is aligned to {locale}"))
+        else:
+            findings.append(
+                Finding(
+                    "system",
+                    "locale",
+                    "fail",
+                    f"Locale is not aligned to {locale}",
+                    details=[
+                        f"LANG={os.environ.get('LANG', '')}",
+                        f"LC_ALL={os.environ.get('LC_ALL', '')}",
+                        f".zprofile={'ok' if zprofile_ok else 'missing'}",
+                        f".zshrc={'ok' if zshrc_ok else 'missing'}",
+                    ],
+                )
+            )
+    else:
+        findings.append(Finding("system", "locale", "warn", "Target locale is unknown; pass --target-locale to enforce"))
+
+    current_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    if proxy_url:
+        if current_proxy == proxy_url and zprofile_ok and zshrc_ok:
+            findings.append(Finding("system", "proxy-env", "pass", f"Proxy env is aligned to {proxy_url}"))
+        else:
+            findings.append(
+                Finding(
+                    "system",
+                    "proxy-env",
+                    "fail",
+                    f"Proxy env is not aligned to {proxy_url}",
+                    details=[
+                        f"HTTP_PROXY={current_proxy or ''}",
+                        f".zprofile={'ok' if zprofile_ok else 'missing'}",
+                        f".zshrc={'ok' if zshrc_ok else 'missing'}",
+                    ],
+                )
+            )
     else:
         findings.append(
-            Finding(
-                "system",
-                "locale-timezone",
-                "fail",
-                "Timezone or locale is not fully aligned",
-                details=[
-                    f"TZ={os.environ.get('TZ', '')}",
-                    f"LANG={os.environ.get('LANG', '')}",
-                    f"LC_ALL={os.environ.get('LC_ALL', '')}",
-                    f".zprofile={'ok' if zprofile_ok else 'missing'}",
-                    f".zshrc={'ok' if zshrc_ok else 'missing'}",
-                ],
-            )
+            Finding("system", "proxy-env", "warn", "Target proxy URL is unknown; pass --proxy-url to enforce")
         )
 
     input_source = parse_input_source()
@@ -428,7 +523,7 @@ def inspect_clash(context: Context, public_ip: str | None) -> list[Finding]:
 
     runtime_yaml = context.clash_dir / "clash-verge.yaml"
     runtime_text = runtime_yaml.read_text(encoding="utf-8", errors="ignore") if runtime_yaml.exists() else ""
-    missing_markers = [marker for marker in PUBLIC_MARKERS[:3] if marker not in runtime_text]
+    missing_markers = [marker for marker in GENERIC_PUBLIC_MARKERS if marker not in runtime_text]
     if missing_markers:
         findings.append(Finding("clash", "runtime-markers", "fail", f"Runtime config is missing markers: {', '.join(missing_markers)}"))
     else:
@@ -471,13 +566,11 @@ def inspect_public_subscription(context: Context) -> list[Finding]:
     """检查公开订阅内容。"""
     if not context.public_subscription_url:
         return [Finding("vpn", "public-subscription", "skip", "Public subscription URL is not configured")]
-    try:
-        with urlopen(context.public_subscription_url, timeout=12) as response:
-            text = response.read().decode("utf-8", errors="ignore")
-    except URLError as error:
-        return [Finding("vpn", "public-subscription", "fail", f"Cannot fetch public subscription: {error.reason}")]
+    text = fetch_text_url(context.public_subscription_url, timeout=12, retries=2)
+    if text is None:
+        return [Finding("vpn", "public-subscription", "warn", "Cannot fetch public subscription right now; retry later")]
 
-    missing = [marker for marker in PUBLIC_MARKERS if marker not in text]
+    missing = [marker for marker in GENERIC_PUBLIC_MARKERS if marker not in text]
     if missing:
         return [Finding("vpn", "public-subscription", "fail", f"Public subscription is missing markers: {', '.join(missing)}")]
     return [Finding("vpn", "public-subscription", "pass", "Public subscription contains hardened markers")]
@@ -490,6 +583,11 @@ def inspect_remote_vpn(context: Context) -> list[Finding]:
     if paramiko is None:
         return [Finding("vpn", "remote-service", "skip", "paramiko is unavailable")]
 
+    builder_module = load_module(
+        context.vpn_root / "scripts" / "subscription_builder.py",
+        "builder_for_cc_check_remote",
+        context.vpn_root / "scripts",
+    )
     deploy_module = load_module(
         context.vpn_root / "scripts" / "deploy_6node_subscription.py",
         "deploy_for_cc_check",
@@ -497,6 +595,8 @@ def inspect_remote_vpn(context: Context) -> list[Finding]:
     )
     if deploy_module is None or not hasattr(deploy_module, "REMOTE"):
         return [Finding("vpn", "remote-service", "fail", "Cannot load VPN deploy script metadata")]
+    if builder_module is None or not hasattr(builder_module, "build_state"):
+        return [Finding("vpn", "remote-service", "fail", "Cannot load VPN builder metadata")]
 
     remote = deploy_module.REMOTE
     host = remote.get("host")
@@ -506,31 +606,35 @@ def inspect_remote_vpn(context: Context) -> list[Finding]:
     if not all([host, user, password]):
         return [Finding("vpn", "remote-service", "fail", "Remote deployment credentials are incomplete")]
 
+    state = builder_module.build_state()
+    service_name = state.get("runtime", {}).get("vpn_service", {}).get("name", "vpn-service")
+    service_port = state.get("ss", {}).get("port", 8388)
+
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=host, port=port, username=user, password=password, timeout=20, banner_timeout=20)
     except Exception as error:
-        return [Finding("vpn", "remote-service", "fail", f"Cannot connect to VPN host: {error.__class__.__name__}")]
+        return [Finding("vpn", "remote-service", "warn", f"Cannot connect to VPN host: {error.__class__.__name__}")]
 
     try:
-        active = remote_exec(client, "systemctl is-active gpteam-ss").strip()
-        listeners = remote_exec(client, "ss -lntup | grep 8388 || true")
+        active = remote_exec(client, f"systemctl is-active {service_name}").strip()
+        listeners = remote_exec(client, f"ss -lntup | grep {service_port} || true")
     finally:
         client.close()
 
     findings: list[Finding] = []
     if active == "active":
-        findings.append(Finding("vpn", "remote-service", "pass", "Remote gpteam-ss service is active"))
+        findings.append(Finding("vpn", "remote-service", "pass", f"Remote {service_name} service is active"))
     else:
-        findings.append(Finding("vpn", "remote-service", "fail", f"Remote gpteam-ss service is {active or 'unknown'}"))
+        findings.append(Finding("vpn", "remote-service", "fail", f"Remote {service_name} service is {active or 'unknown'}"))
 
     if "xray" in listeners.lower():
-        findings.append(Finding("vpn", "remote-listener", "pass", "Remote 8388 listener belongs to Xray"))
-    elif "8388" in listeners:
-        findings.append(Finding("vpn", "remote-listener", "fail", "Remote 8388 listener is not owned by Xray"))
+        findings.append(Finding("vpn", "remote-listener", "pass", f"Remote {service_port} listener belongs to Xray"))
+    elif str(service_port) in listeners:
+        findings.append(Finding("vpn", "remote-listener", "fail", f"Remote {service_port} listener is not owned by Xray"))
     else:
-        findings.append(Finding("vpn", "remote-listener", "fail", "Remote 8388 listener is missing"))
+        findings.append(Finding("vpn", "remote-listener", "fail", f"Remote {service_port} listener is missing"))
     return findings
 
 
@@ -558,7 +662,7 @@ def inspect_vpn(context: Context) -> list[Finding]:
     generated_file = context.vpn_root / "docs/output/clash-meta.yaml"
     if generated_file.exists():
         text = generated_file.read_text(encoding="utf-8", errors="ignore")
-        missing = [marker for marker in PUBLIC_MARKERS if marker not in text]
+        missing = [marker for marker in GENERIC_PUBLIC_MARKERS if marker not in text]
         if missing:
             findings.append(Finding("vpn", "generated-subscription", "fail", f"Generated subscription is missing markers: {', '.join(missing)}"))
         else:
@@ -575,8 +679,13 @@ def collect_findings(context: Context) -> list[Finding]:
     """收集所有发现。"""
     public_ip = fetch_public_ip()
     findings: list[Finding] = []
+    ip_quality: dict[str, Any] | None = None
+    if public_ip:
+        ip_quality = assess_ip_quality(public_ip, context.expected_ip_type)
+        findings.append(Finding("ip-quality", "classification", ip_quality["status"], ip_quality["summary"], ip_quality["details"]))
+    target_profile = build_target_profile(context, public_ip, ip_quality)
     findings.extend(inspect_claude(context))
-    findings.extend(inspect_system(context))
+    findings.extend(inspect_system(context, target_profile))
     findings.extend(inspect_clash(context, public_ip))
     findings.extend(inspect_vpn(context))
     if public_ip:
@@ -586,7 +695,31 @@ def collect_findings(context: Context) -> list[Finding]:
     return findings
 
 
-def upsert_env_block(path: Path) -> None:
+def build_env_block(targets: dict[str, str | None]) -> str:
+    """构建受管环境块。"""
+    lines = [ENV_BLOCK_START]
+    if targets.get("timezone"):
+        lines.append(f'export TZ="{targets["timezone"]}"')
+    if targets.get("locale"):
+        lines.append(f'export LANG="{targets["locale"]}"')
+        lines.append(f'export LC_ALL="{targets["locale"]}"')
+    if targets.get("language"):
+        lines.append(f'export LANGUAGE="{targets["language"]}"')
+    if targets.get("proxy_url"):
+        lines.append(f'export HTTP_PROXY="{targets["proxy_url"]}"')
+        lines.append('export HTTPS_PROXY="$HTTP_PROXY"')
+        lines.append('export http_proxy="$HTTP_PROXY"')
+        lines.append('export https_proxy="$HTTP_PROXY"')
+        lines.append('export ALL_PROXY="$HTTP_PROXY"')
+        lines.append('export all_proxy="$HTTP_PROXY"')
+    lines.append('export DISABLE_TELEMETRY="1"')
+    lines.append('export DISABLE_ERROR_REPORTING="1"')
+    lines.append('export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"')
+    lines.append(ENV_BLOCK_END)
+    return "\n".join(lines)
+
+
+def upsert_env_block(path: Path, targets: dict[str, str | None]) -> None:
     """写入受管环境块。"""
     original = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
     pattern = re.compile(
@@ -594,10 +727,11 @@ def upsert_env_block(path: Path) -> None:
         re.DOTALL,
     )
     updated = pattern.sub("", original).strip()
+    block = build_env_block(targets)
     if updated:
-        updated = ENV_BLOCK + "\n\n" + updated + "\n"
+        updated = block + "\n\n" + updated + "\n"
     else:
-        updated = ENV_BLOCK + "\n"
+        updated = block + "\n"
     path.write_text(updated, encoding="utf-8")
 
 
@@ -712,19 +846,40 @@ def clear_git_identity() -> list[str]:
     return actions
 
 
-def fix_local(context: Context) -> list[str]:
+def has_failure(findings: list[Finding], keys: set[str]) -> bool:
+    """判断是否存在指定失败项。"""
+    return any(item.status == "fail" and item.key in keys for item in findings)
+
+
+def fix_local(context: Context, findings: list[Finding] | None = None) -> list[str]:
     """执行本地修复。"""
+    findings = findings or collect_findings(context)
+    public_ip = fetch_public_ip()
+    targets = build_target_profile(context, public_ip)
     actions: list[str] = []
-    upsert_env_block(context.home / ".zprofile")
-    upsert_env_block(context.home / ".zshrc")
-    actions.append("Updated ~/.zprofile and ~/.zshrc managed env block")
-    actions.extend(remove_telemetry(context))
-    actions.extend(clear_git_identity())
-    if context.clash_dir is not None:
+
+    if has_failure(findings, {"timezone", "locale", "proxy-env", "privacy-env"}):
+        upsert_env_block(context.home / ".zprofile", targets)
+        upsert_env_block(context.home / ".zshrc", targets)
+        actions.append("Updated shell managed env block")
+
+    if has_failure(findings, {"telemetry"}):
+        actions.extend(remove_telemetry(context))
+
+    if has_failure(findings, {"git-identity"}):
+        actions.extend(clear_git_identity())
+
+    if context.clash_dir is not None and has_failure(findings, {"system-dns-display"}):
         ensure_verge_dns_toggle(context.clash_dir)
         actions.append("Set Clash Verge enable_dns_settings to false")
-    actions.extend(install_dns_cleanup(context))
-    actions.extend(clear_suspicious_dns_display())
+
+    if has_failure(findings, {"system-dns-display"}) or any(
+        item.key == "dns-cleanup-watchdog" and item.status != "pass" for item in findings
+    ):
+        actions.extend(install_dns_cleanup(context))
+
+    if has_failure(findings, {"system-dns-display"}):
+        actions.extend(clear_suspicious_dns_display())
     return actions
 
 
@@ -762,16 +917,17 @@ def should_run_deploy(findings: list[Finding]) -> bool:
     return any(item.status == "fail" and item.key in repair_keys for item in findings)
 
 
-def fix_vpn(context: Context) -> list[str]:
+def fix_vpn(context: Context, findings: list[Finding] | None = None) -> list[str]:
     """执行 VPN 修复。"""
     if context.vpn_root is None:
         return ["Skip VPN fixes: VPN project root not found"]
 
+    findings = findings or inspect_vpn(context)
     actions: list[str] = []
-    run_zsh(f'cd "{context.vpn_root}" && python3 scripts/subscription_builder.py', timeout=120)
-    actions.append("Regenerated VPN subscription outputs")
+    if has_failure(findings, {"generated-subscription", "public-subscription", "remote-service", "remote-listener"}):
+        run_zsh(f'cd "{context.vpn_root}" && python3 scripts/subscription_builder.py', timeout=120)
+        actions.append("Regenerated VPN subscription outputs")
 
-    findings = inspect_vpn(context)
     if should_run_deploy(findings):
         deploy_cmd = f'cd "{context.vpn_root}" && python3 scripts/deploy_6node_subscription.py'
         result = run_zsh(deploy_cmd, timeout=1800)
@@ -815,14 +971,16 @@ def command_inspect(context: Context, as_json: bool) -> int:
 
 def command_fix_local(context: Context) -> int:
     """执行本地修复。"""
-    for action in fix_local(context):
+    actions = fix_local(context)
+    for action in actions or ["No local repairs needed"]:
         print(action)
     return 0
 
 
 def command_fix_vpn(context: Context) -> int:
     """执行 VPN 修复。"""
-    for action in fix_vpn(context):
+    actions = fix_vpn(context)
+    for action in actions or ["No VPN repairs needed"]:
         print(action)
     return 0
 
@@ -845,10 +1003,10 @@ def command_full(context: Context, as_json: bool) -> int:
     local_fail = any(item.group in {"claude", "system", "clash"} and item.status == "fail" for item in initial)
     vpn_fail = any(item.group == "vpn" and item.status == "fail" for item in initial)
     if local_fail:
-        for action in fix_local(context):
+        for action in fix_local(context, initial):
             print(action)
     if vpn_fail:
-        for action in fix_vpn(context):
+        for action in fix_vpn(context, initial):
             print(action)
     return command_verify(context, as_json)
 
@@ -871,11 +1029,21 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--vpn-root", help="Override VPN project root")
         subparser.add_argument("--clash-dir", help="Override Clash Verge support directory")
         subparser.add_argument("--public-subscription-url", help="Override public subscription URL")
+        subparser.add_argument("--target-timezone", help="Expected timezone for environment alignment")
+        subparser.add_argument("--target-locale", help="Expected locale, e.g. en_US.UTF-8")
+        subparser.add_argument("--target-language", help="Expected language, e.g. en_US")
+        subparser.add_argument("--proxy-url", help="Expected proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7898")
+        subparser.add_argument("--expected-ip-type", default="residential", help="Expected public IP type, default residential")
         subparser.add_argument("--json", action="store_true", help="Print findings as JSON")
     dns_parser = subparsers.add_parser("fix-system-dns-display")
     dns_parser.add_argument("--vpn-root", help="Override VPN project root")
     dns_parser.add_argument("--clash-dir", help="Override Clash Verge support directory")
     dns_parser.add_argument("--public-subscription-url", help="Override public subscription URL")
+    dns_parser.add_argument("--target-timezone", help="Expected timezone for environment alignment")
+    dns_parser.add_argument("--target-locale", help="Expected locale, e.g. en_US.UTF-8")
+    dns_parser.add_argument("--target-language", help="Expected language, e.g. en_US")
+    dns_parser.add_argument("--proxy-url", help="Expected proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7898")
+    dns_parser.add_argument("--expected-ip-type", default="residential", help="Expected public IP type, default residential")
     dns_parser.add_argument("--quiet", action="store_true", help="Suppress normal output")
     return parser
 
