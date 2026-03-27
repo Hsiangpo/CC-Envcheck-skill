@@ -1,4 +1,4 @@
 interface:
   display_name: "CC Check"
-  short_description: "Audit and repair Claude, Clash Verge, and VPN state"
-  default_prompt: "Use $cc-check to inspect first, then repair and verify Claude, Clash Verge, public IP quality, and the current VPN environment."
+  short_description: "Inspect and repair Claude, Clash Verge, and VPN environment drift"
+  default_prompt: "Use $cc-check to inspect first, then repair and verify Claude, Clash Verge, public IP quality, and any supported VPN project on this machine."

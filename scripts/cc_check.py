@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CC-check 技能主脚本。"""
+"""CC-check v2 — 跨平台 Claude Code / 代理环境审计与修复工具。
+
+支持 macOS / Linux / Windows。
+功能：inspect → fix → verify 闭环，100分制评分，dry-run 预览。
+"""
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
-import plistlib
 import re
 import socket
 import subprocess
@@ -19,43 +21,45 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
-try:
-    import paramiko  # type: ignore
-except Exception:  # pragma: no cover - 依赖缺失时降级
-    paramiko = None
+# Ensure sibling modules are importable
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ip_quality import assess_ip_quality
+from scoring import compute_score, format_score_report
+import platform_ops as plat
+import vpn_adapter as vpnops
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 ENV_BLOCK_START = "# >>> cc-check env >>>"
 ENV_BLOCK_END = "# <<< cc-check env <<<"
-SUSPICIOUS_DNS = {
-    "114.114.114.114",
-    "223.5.5.5",
-    "223.6.6.6",
-    "119.29.29.29",
-}
+
 GENERIC_PUBLIC_MARKERS = [
     "dns-hijack",
     "respect-rules: true",
     "proxy-server-nameserver",
 ]
-LOW_RISK_GOOGLE_MARKERS = (
-    "2400:cb00:",
-    "192.178.",
-    "172.69.",
-    "108.162.",
-)
-FAIL_GOOGLE_MARKERS = (
-    "124.220.",
-    "124.23.",
-    "210.87.",
-    "223.6.6.6",
-    "114.114.114.114",
-)
-LAUNCH_AGENT_LABEL = "io.github.clash-verge-rev.dns-cleanup"
-LAUNCH_AGENT_NAME = f"{LAUNCH_AGENT_LABEL}.plist"
-CLASH_APP_PROCESS = "/Applications/Clash Verge.app/Contents/MacOS/clash-verge"
+
+LOW_RISK_GOOGLE_MARKERS = ("2400:cb00:", "192.178.", "172.69.", "108.162.", "172.71.")
+FAIL_GOOGLE_MARKERS = ("124.220.", "124.23.", "210.87.", "223.6.6.6", "114.114.114.114")
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Finding:
+    group: str
+    key: str
+    status: str       # pass | fail | warn | skip
+    summary: str
+    details: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -71,33 +75,14 @@ class Context:
     target_language: str | None
     proxy_url: str | None
     expected_ip_type: str
+    dry_run: bool
 
 
-@dataclass
-class Finding:
-    group: str
-    key: str
-    status: str
-    summary: str
-    details: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-def run_zsh(command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    """执行 zsh 命令并返回结果。"""
-    return subprocess.run(
-        ["/bin/zsh", "-lc", command],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def load_json(path: Path) -> dict[str, Any] | None:
-    """读取 JSON 文件。"""
     if not path.exists():
         return None
     try:
@@ -106,183 +91,23 @@ def load_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def load_module(path: Path, name: str, extra_path: Path | None = None) -> Any | None:
-    """动态加载 Python 模块。"""
-    if not path.exists():
-        return None
-    if extra_path is not None:
-        sys.path.insert(0, str(extra_path))
-    try:
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
-    except Exception:
-        return None
-    finally:
-        if extra_path is not None and sys.path and sys.path[0] == str(extra_path):
-            sys.path.pop(0)
-
-
-def detect_vpn_root(explicit: str | None) -> Path | None:
-    """发现 VPN 项目根目录。"""
-    candidates: list[Path] = []
-    if explicit:
-        candidates.append(Path(explicit).expanduser())
-    env_path = os.environ.get("CC_CHECK_VPN_PROJECT_ROOT")
-    if env_path:
-        candidates.append(Path(env_path).expanduser())
-
-    home = Path.home()
-    candidates.extend([home / "Develop", home / "Projects", home / "Code", home])
-
-    for candidate in candidates:
-        if candidate.is_file():
-            continue
-        direct = candidate / "scripts" / "subscription_builder.py"
-        if direct.exists():
-            return candidate
-        try:
-            for match in candidate.glob("**/scripts/subscription_builder.py"):
-                parts = match.parts
-                if ".git" in parts:
-                    continue
-                return match.parents[1]
-        except Exception:
-            continue
-    return None
-
-
-def detect_clash_dir(explicit: str | None) -> Path | None:
-    """发现 Clash Verge 支持目录。"""
-    if explicit:
-        path = Path(explicit).expanduser()
-        return path if path.exists() else None
-
-    env_path = os.environ.get("CC_CHECK_CLASH_DIR")
-    if env_path:
-        path = Path(env_path).expanduser()
-        return path if path.exists() else None
-
-    default_path = (
-        Path.home()
-        / "Library"
-        / "Application Support"
-        / "io.github.clash-verge-rev.clash-verge-rev"
-    )
-    return default_path if default_path.exists() else None
-
-
-def detect_public_subscription_url(vpn_root: Path | None, explicit: str | None) -> str | None:
-    """发现公开订阅地址。"""
-    if explicit:
-        return explicit
-
-    env_url = os.environ.get("CC_CHECK_PUBLIC_SUBSCRIPTION_URL")
-    if env_url:
-        return env_url
-
-    if vpn_root is None:
-        return None
-
-    builder = load_module(
-        vpn_root / "scripts" / "subscription_builder.py",
-        "subscription_builder_for_cc_check",
-        vpn_root / "scripts",
-    )
-    if builder is None:
-        return None
-    try:
-        state = builder.build_state()
-        return state.get("subscription_url")
-    except Exception:
-        return None
-
-
-def make_context(args: argparse.Namespace) -> Context:
-    """构建运行上下文。"""
-    skill_root = Path(__file__).resolve().parents[1]
-    home = Path.home()
-    claude_dir = home / ".claude"
-    vpn_root = detect_vpn_root(args.vpn_root)
-    clash_dir = detect_clash_dir(args.clash_dir)
-    public_subscription_url = detect_public_subscription_url(vpn_root, args.public_subscription_url)
-    return Context(
-        skill_root=skill_root,
-        home=home,
-        claude_dir=claude_dir,
-        clash_dir=clash_dir,
-        vpn_root=vpn_root,
-        public_subscription_url=public_subscription_url,
-        target_timezone=args.target_timezone,
-        target_locale=args.target_locale,
-        target_language=args.target_language,
-        proxy_url=args.proxy_url or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"),
-        expected_ip_type=args.expected_ip_type,
-    )
-
-
-def profile_has_expected_env(path: Path, targets: dict[str, str | None]) -> bool:
-    """检查 profile 是否包含目标环境块。"""
-    if not path.exists():
-        return False
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    expected_tokens = [
-        f'TZ="{targets["timezone"]}"' if targets.get("timezone") else "",
-        f'LANG="{targets["locale"]}"' if targets.get("locale") else "",
-        f'HTTP_PROXY="{targets["proxy_url"]}"' if targets.get("proxy_url") else "",
-        'DISABLE_TELEMETRY="1"',
-        'DISABLE_ERROR_REPORTING="1"',
-        'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"',
-    ]
-    return all(token in text for token in expected_tokens if token)
-
-
-def get_dns_servers(service: str) -> list[str]:
-    """读取某个网络服务的 DNS。"""
-    result = run_zsh(f'networksetup -getdnsservers "{service}"')
-    if result.returncode != 0:
-        return []
-    output = result.stdout.strip()
-    if "There aren't any DNS Servers set" in output:
-        return []
-    return [line.strip() for line in output.splitlines() if line.strip()]
-
-
-def list_network_services() -> list[str]:
-    """列出网络服务。"""
-    result = run_zsh("networksetup -listallnetworkservices")
-    if result.returncode != 0:
-        return []
-    services: list[str] = []
-    for line in result.stdout.splitlines()[1:]:
-        cleaned = line.lstrip("*").strip()
-        if cleaned:
-            services.append(cleaned)
-    return services
-
-
 def fetch_public_ip() -> str | None:
-    """读取当前外网 IP。"""
-    for url in ("https://ifconfig.me/ip", "https://api.ipify.org"):
+    for url in ("https://ifconfig.me/ip", "https://api.ipify.org", "https://icanhazip.com"):
         try:
-            with urlopen(url, timeout=8) as response:
-                value = response.read().decode("utf-8", errors="ignore").strip()
-                if value:
-                    return value
+            with urlopen(url, timeout=8) as resp:
+                val = resp.read().decode("utf-8", errors="ignore").strip()
+                if val:
+                    return val
         except (URLError, TimeoutError, socket.timeout, OSError):
             continue
     return None
 
 
 def fetch_text_url(url: str, timeout: int = 12, retries: int = 2) -> str | None:
-    """读取文本接口并做简单重试。"""
     for _ in range(retries):
         try:
-            with urlopen(url, timeout=timeout) as response:
-                text = response.read().decode("utf-8", errors="ignore")
+            with urlopen(url, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", errors="ignore")
                 if text:
                     return text
         except (URLError, TimeoutError, socket.timeout, OSError):
@@ -290,413 +115,466 @@ def fetch_text_url(url: str, timeout: int = 12, retries: int = 2) -> str | None:
     return None
 
 
-def parse_input_source() -> str | None:
-    """读取当前输入法。"""
-    path = Path.home() / "Library/Preferences/com.apple.HIToolbox.plist"
-    if not path.exists():
-        return None
-    try:
-        payload = plistlib.loads(path.read_bytes())
-    except Exception:
-        return None
-    sources = payload.get("AppleSelectedInputSources", [])
-    if not isinstance(sources, list):
-        return None
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        bundle_id = source.get("Bundle ID")
-        input_mode = source.get("Input Mode")
-        if input_mode:
-            return str(input_mode)
-        if bundle_id:
-            return str(bundle_id)
-    return None
-
-
-def get_clash_json(path: str) -> dict[str, Any] | None:
-    """通过 mihomo unix socket 读取 JSON。"""
-    command = f"curl --silent --show-error --unix-socket /tmp/verge/verge-mihomo.sock http://localhost/{path}"
-    result = run_zsh(command, timeout=8)
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
-
-
 def classify_google_dns(lines: list[str]) -> tuple[str, str]:
-    """根据 Google whoami 结果给出状态。"""
     text = " | ".join(lines)
     if not text:
         return "warn", "Google DNS whoami returned empty output"
-    if any(marker in text for marker in FAIL_GOOGLE_MARKERS):
-        return "fail", f"Google DNS whoami still shows suspicious output: {text}"
-    if any(marker in text for marker in LOW_RISK_GOOGLE_MARKERS) or "edns0-client-subnet" in text:
-        return "warn", f"Google DNS PoP is acceptable but not ideal: {text}"
-    return "pass", f"Google DNS whoami looks acceptable: {text}"
+    if any(m in text for m in FAIL_GOOGLE_MARKERS):
+        return "fail", f"Google DNS whoami shows China ISP: {text}"
+    if any(m in text for m in LOW_RISK_GOOGLE_MARKERS) or "edns0-client-subnet" in text:
+        return "warn", f"Google DNS PoP acceptable but not ideal: {text}"
+    return "pass", f"Google DNS whoami clean: {text}"
 
 
-def build_target_profile(
-    context: Context,
-    public_ip: str | None,
-    ip_quality: dict[str, Any] | None = None,
-) -> dict[str, str | None]:
-    """构建目标环境配置。"""
+# ---------------------------------------------------------------------------
+# Build context
+# ---------------------------------------------------------------------------
+
+def make_context(args: argparse.Namespace) -> Context:
+    skill_root = Path(__file__).resolve().parents[1]
+    home = Path.home()
+    vpn_root = vpnops.detect_root(getattr(args, "vpn_root", None))
+    clash_dir = plat.detect_clash_dir(getattr(args, "clash_dir", None))
+    pub_sub = vpnops.detect_public_subscription_url(vpn_root, getattr(args, "public_subscription_url", None))
+    return Context(
+        skill_root=skill_root, home=home,
+        claude_dir=home / ".claude",
+        clash_dir=clash_dir, vpn_root=vpn_root,
+        public_subscription_url=pub_sub,
+        target_timezone=getattr(args, "target_timezone", None),
+        target_locale=getattr(args, "target_locale", None),
+        target_language=getattr(args, "target_language", None),
+        proxy_url=getattr(args, "proxy_url", None) or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy"),
+        expected_ip_type=getattr(args, "expected_ip_type", "residential"),
+        dry_run=getattr(args, "dry_run", False),
+    )
+
+
+def build_target_profile(ctx: Context, public_ip: str | None, ip_q: dict[str, Any] | None = None) -> dict[str, str | None]:
     profile: dict[str, str | None] = {
-        "timezone": context.target_timezone,
-        "locale": context.target_locale,
-        "language": context.target_language,
-        "proxy_url": context.proxy_url,
+        "timezone": ctx.target_timezone,
+        "locale": ctx.target_locale,
+        "language": ctx.target_language,
+        "proxy_url": ctx.proxy_url,
     }
     if public_ip:
-        quality = ip_quality or assess_ip_quality(public_ip, context.expected_ip_type)
+        q = ip_q or assess_ip_quality(public_ip, ctx.expected_ip_type)
         if not profile["timezone"]:
-            profile["timezone"] = quality.get("target_timezone")
+            profile["timezone"] = q.get("target_timezone")
         if not profile["locale"]:
-            profile["locale"] = quality.get("target_locale")
+            profile["locale"] = q.get("target_locale")
         if not profile["language"]:
-            profile["language"] = quality.get("target_language")
+            profile["language"] = q.get("target_language")
     if not profile["proxy_url"]:
-        configs = get_clash_json("configs")
-        mixed_port = configs.get("mixed-port") if isinstance(configs, dict) else None
-        if mixed_port:
-            profile["proxy_url"] = f"http://127.0.0.1:{mixed_port}"
+        configs = plat.get_clash_api_json("configs")
+        if isinstance(configs, dict) and configs.get("mixed-port"):
+            profile["proxy_url"] = f"http://127.0.0.1:{configs['mixed-port']}"
     return profile
 
 
-def inspect_claude(context: Context) -> list[Finding]:
-    """检查 Claude 相关配置。"""
+# ---------------------------------------------------------------------------
+# INSPECTION: All check groups
+# ---------------------------------------------------------------------------
+
+def inspect_network(public_ip: str | None) -> list[Finding]:
     findings: list[Finding] = []
-    settings_path = context.claude_dir / "settings.json"
-    settings = load_json(settings_path)
-    if settings is None:
-        findings.append(Finding("claude", "settings", "fail", "Claude settings.json is missing or invalid"))
-    else:
-        language = settings.get("language")
-        if language and str(language).lower() != "english":
-            findings.append(Finding("claude", "language", "warn", f"Claude language is set to {language}"))
-        else:
-            findings.append(Finding("claude", "language", "pass", "Claude language setting is neutral"))
 
-    telemetry_dir = context.claude_dir / "telemetry"
-    if telemetry_dir.exists() and any(telemetry_dir.iterdir()):
-        findings.append(Finding("claude", "telemetry", "fail", "Claude telemetry residue exists"))
+    # Public IP
+    if public_ip:
+        findings.append(Finding("network", "public-ip", "pass", f"Public IP is {public_ip}"))
     else:
-        findings.append(Finding("claude", "telemetry", "pass", "Claude telemetry residue is clean"))
+        findings.append(Finding("network", "public-ip", "fail", "Cannot determine public IP"))
+        return findings
 
-    missing_env = [
-        key
-        for key in (
-            "DISABLE_TELEMETRY",
-            "DISABLE_ERROR_REPORTING",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-        )
-        if os.environ.get(key) != "1"
-    ]
-    if missing_env:
-        findings.append(Finding("claude", "privacy-env", "fail", f"Missing runtime privacy env: {', '.join(missing_env)}"))
+    # Multi-source consistency
+    alt_ip = None
+    for url in ("https://api64.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urlopen(url, timeout=8) as resp:
+                alt_ip = resp.read().decode("utf-8", errors="ignore").strip()
+                if alt_ip:
+                    break
+        except Exception:
+            continue
+    if alt_ip and alt_ip == public_ip:
+        findings.append(Finding("network", "multi-source-ip", "pass", f"Multi-source IP consistent: {alt_ip}"))
+    elif alt_ip:
+        findings.append(Finding("network", "multi-source-ip", "fail", f"IP mismatch: primary={public_ip} alt={alt_ip}"))
     else:
-        findings.append(Finding("claude", "privacy-env", "pass", "Runtime privacy env is aligned"))
+        findings.append(Finding("network", "multi-source-ip", "warn", "Could not verify IP from alternative source"))
+
+    # IPv6 leak
+    ipv6_ip = None
+    try:
+        with urlopen("https://api64.ipify.org", timeout=8) as resp:
+            ipv6_ip = resp.read().decode("utf-8", errors="ignore").strip()
+    except Exception:
+        pass
+    if ipv6_ip and ipv6_ip == public_ip:
+        findings.append(Finding("network", "ipv6-leak", "pass", f"IPv6 consistent with IPv4: {ipv6_ip}"))
+    elif ipv6_ip:
+        findings.append(Finding("network", "ipv6-leak", "warn", f"IPv6 response differs: {ipv6_ip}"))
+    else:
+        findings.append(Finding("network", "ipv6-leak", "skip", "IPv6 check unavailable"))
     return findings
 
 
-def inspect_system(context: Context, targets: dict[str, str | None]) -> list[Finding]:
-    """检查系统环境。"""
+def inspect_dns(public_ip: str | None) -> list[Finding]:
     findings: list[Finding] = []
-    timezone = targets.get("timezone")
-    locale = targets.get("locale")
-    proxy_url = targets.get("proxy_url")
-    zprofile_ok = profile_has_expected_env(context.home / ".zprofile", targets)
-    zshrc_ok = profile_has_expected_env(context.home / ".zshrc", targets)
 
-    if timezone:
-        tz_ok = os.environ.get("TZ") == timezone
-        if tz_ok and zprofile_ok and zshrc_ok:
-            findings.append(Finding("system", "timezone", "pass", f"Timezone is aligned to {timezone}"))
-        else:
-            findings.append(
-                Finding(
-                    "system",
-                    "timezone",
-                    "fail",
-                    f"Timezone is not aligned to {timezone}",
-                    details=[
-                        f"TZ={os.environ.get('TZ', '')}",
-                        f".zprofile={'ok' if zprofile_ok else 'missing'}",
-                        f".zshrc={'ok' if zshrc_ok else 'missing'}",
-                    ],
-                )
-            )
+    # Google DNS whoami
+    r = plat.run_shell("dig +time=3 +tries=1 +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null")
+    lines = [l.strip().strip('"') for l in r.stdout.splitlines() if l.strip()]
+    status, summary = classify_google_dns(lines)
+    findings.append(Finding("dns", "dns-google", status, summary))
+
+    # Cloudflare DNS whoami
+    r = plat.run_shell("dig +time=3 +tries=1 +short CH TXT whoami.cloudflare @1.1.1.1 2>/dev/null")
+    cf = r.stdout.strip().replace('"', "")
+    if public_ip and cf == public_ip:
+        findings.append(Finding("dns", "dns-cloudflare", "pass", f"Cloudflare DNS matches egress: {cf}"))
+    elif cf:
+        findings.append(Finding("dns", "dns-cloudflare", "warn", f"Cloudflare DNS returned: {cf}"))
     else:
-        findings.append(Finding("system", "timezone", "warn", "Target timezone is unknown; pass --target-timezone to enforce"))
+        findings.append(Finding("dns", "dns-cloudflare", "fail", "Cloudflare DNS whoami returned empty"))
 
+    # System DNS display
+    dns_map = plat.get_dns_servers()
+    suspicious_services = []
+    for svc, servers in dns_map.items():
+        if any(s in plat.SUSPICIOUS_DNS for s in servers):
+            suspicious_services.append(f"{svc}: {', '.join(servers)}")
+    if suspicious_services:
+        findings.append(Finding("dns", "system-dns-display", "fail",
+                                f"Suspicious DNS on: {'; '.join(suspicious_services)}"))
+    else:
+        findings.append(Finding("dns", "system-dns-display", "pass", "System DNS display is clean"))
+    return findings
+
+
+def inspect_system(ctx: Context, targets: dict[str, str | None]) -> list[Finding]:
+    findings: list[Finding] = []
+    tz = targets.get("timezone")
+    locale = targets.get("locale")
+    proxy = targets.get("proxy_url")
+
+    # Timezone
+    if tz:
+        env_tz = os.environ.get("TZ", "")
+        sys_tz = plat.get_system_timezone()
+        if env_tz == tz and (sys_tz == tz or not sys_tz):
+            findings.append(Finding("system", "timezone", "pass", f"Timezone aligned: {tz}"))
+        else:
+            findings.append(Finding("system", "timezone", "fail", f"Timezone not aligned to {tz}",
+                                    [f"TZ={env_tz}", f"system={sys_tz}"]))
+    else:
+        findings.append(Finding("system", "timezone", "warn", "Target timezone unknown"))
+
+    # Locale
     if locale:
         lang_ok = os.environ.get("LANG") == locale
-        lc_all_ok = os.environ.get("LC_ALL") == locale
-        if lang_ok and lc_all_ok and zprofile_ok and zshrc_ok:
-            findings.append(Finding("system", "locale", "pass", f"Locale is aligned to {locale}"))
+        lc_ok = os.environ.get("LC_ALL") == locale
+        if lang_ok and lc_ok:
+            findings.append(Finding("system", "locale", "pass", f"Locale aligned: {locale}"))
         else:
-            findings.append(
-                Finding(
-                    "system",
-                    "locale",
-                    "fail",
-                    f"Locale is not aligned to {locale}",
-                    details=[
-                        f"LANG={os.environ.get('LANG', '')}",
-                        f"LC_ALL={os.environ.get('LC_ALL', '')}",
-                        f".zprofile={'ok' if zprofile_ok else 'missing'}",
-                        f".zshrc={'ok' if zshrc_ok else 'missing'}",
-                    ],
-                )
-            )
+            findings.append(Finding("system", "locale", "fail", f"Locale not aligned to {locale}",
+                                    [f"LANG={os.environ.get('LANG', '')}", f"LC_ALL={os.environ.get('LC_ALL', '')}"]))
     else:
-        findings.append(Finding("system", "locale", "warn", "Target locale is unknown; pass --target-locale to enforce"))
+        findings.append(Finding("system", "locale", "warn", "Target locale unknown"))
 
-    current_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-    if proxy_url:
-        if current_proxy == proxy_url and zprofile_ok and zshrc_ok:
-            findings.append(Finding("system", "proxy-env", "pass", f"Proxy env is aligned to {proxy_url}"))
+    # Proxy env
+    cur_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    if proxy:
+        if cur_proxy == proxy:
+            findings.append(Finding("system", "proxy-env", "pass", f"Proxy env aligned: {proxy}"))
         else:
-            findings.append(
-                Finding(
-                    "system",
-                    "proxy-env",
-                    "fail",
-                    f"Proxy env is not aligned to {proxy_url}",
-                    details=[
-                        f"HTTP_PROXY={current_proxy or ''}",
-                        f".zprofile={'ok' if zprofile_ok else 'missing'}",
-                        f".zshrc={'ok' if zshrc_ok else 'missing'}",
-                    ],
-                )
-            )
+            findings.append(Finding("system", "proxy-env", "fail", f"Proxy env not aligned",
+                                    [f"HTTP_PROXY={cur_proxy or '(unset)'}"]))
     else:
-        findings.append(
-            Finding("system", "proxy-env", "warn", "Target proxy URL is unknown; pass --proxy-url to enforce")
-        )
+        findings.append(Finding("system", "proxy-env", "warn", "Target proxy unknown"))
 
-    input_source = parse_input_source()
-    if input_source and ("SCIM" in input_source or "ITABC" in input_source):
-        findings.append(Finding("system", "input-method", "warn", f"Current input source is {input_source}"))
+    # System languages
+    locale_info = plat.get_locale_info()
+    if locale_info.system_languages:
+        langs = locale_info.system_languages
+        if any("zh" in l.lower() or "cn" in l.lower() for l in langs):
+            findings.append(Finding("system", "system-languages", "warn",
+                                    f"System language includes Chinese: {langs}"))
+        else:
+            findings.append(Finding("system", "system-languages", "pass", f"System languages: {langs}"))
     else:
-        findings.append(Finding("system", "input-method", "pass", "Current input source is low-risk"))
+        findings.append(Finding("system", "system-languages", "skip", "Cannot read system languages"))
 
-    name = run_zsh("git config --global user.name").stdout.strip()
-    email = run_zsh("git config --global user.email").stdout.strip()
-    if name or email:
-        findings.append(Finding("system", "git-identity", "fail", "Global git identity is still set"))
+    # Measurement units
+    if locale_info.measurement_units:
+        findings.append(Finding("system", "measurement-units", "pass",
+                                f"Units: {locale_info.measurement_units} / {locale_info.temperature_unit}"))
     else:
-        findings.append(Finding("system", "git-identity", "pass", "Global git identity is clean"))
+        findings.append(Finding("system", "measurement-units", "skip", "Measurement units not available"))
+
+    # Time format
+    if locale_info.time_format_24h is not None:
+        findings.append(Finding("system", "time-format", "pass",
+                                f"{'24h' if locale_info.time_format_24h else '12h'} format"))
+    else:
+        findings.append(Finding("system", "time-format", "skip", "Time format not detectable"))
+
+    # Hostname
+    host_info = plat.get_hostname_info()
+    findings.append(Finding("system", "hostname", "pass", f"Hostname: {host_info.get('hostname', '?')}"))
+
+    # Input method
+    ims = plat.get_active_input_methods()
+    has_chinese = any("SCIM" in im or "ITABC" in im or "Pinyin" in im or "Chinese" in im for im in ims)
+    if has_chinese:
+        findings.append(Finding("system", "input-method", "warn", f"Chinese IME active: {ims[0] if ims else '?'}"))
+    else:
+        findings.append(Finding("system", "input-method", "pass", f"Input method: {ims[0] if ims else 'default'}"))
+
+    # /etc/hosts
+    suspicious_hosts = plat.check_hosts_file()
+    if suspicious_hosts:
+        findings.append(Finding("system", "hosts-file", "warn",
+                                f"{len(suspicious_hosts)} non-standard entries in hosts file",
+                                suspicious_hosts[:5]))
+    else:
+        findings.append(Finding("system", "hosts-file", "pass", "hosts file is clean"))
+
+    # User identity
+    user = plat.get_user_info()
+    findings.append(Finding("system", "user-identity", "pass",
+                            f"User: {user.get('username', '?')} / {user.get('real_name', '?')}"))
     return findings
 
 
-def inspect_clash(context: Context, public_ip: str | None) -> list[Finding]:
-    """检查 Clash Verge 运行态。"""
+def inspect_nodejs(targets: dict[str, str | None]) -> list[Finding]:
     findings: list[Finding] = []
-    if context.clash_dir is None:
-        return [Finding("clash", "support-dir", "skip", "Clash Verge support directory not found")]
+    node_env = plat.get_nodejs_env()
+    tz = targets.get("timezone")
 
-    clash_running = run_zsh(f'pgrep -f "{CLASH_APP_PROCESS}"').returncode == 0
-    if not clash_running:
-        findings.append(Finding("clash", "process", "fail", "Clash Verge process is not running"))
+    if not node_env:
+        findings.append(Finding("nodejs", "node-tz", "skip", "Node.js not available"))
+        findings.append(Finding("nodejs", "node-locale", "skip", "Node.js not available"))
         return findings
-    findings.append(Finding("clash", "process", "pass", "Clash Verge process is running"))
 
-    configs = get_clash_json("configs")
-    global_proxy = get_clash_json("proxies/GLOBAL")
-    if configs is None:
-        findings.append(Finding("clash", "runtime-config", "fail", "Cannot read Clash runtime config"))
+    node_tz = node_env.get("tz", "")
+    if tz and node_tz == tz:
+        findings.append(Finding("nodejs", "node-tz", "pass", f"Node.js TZ: {node_tz}"))
+    elif tz:
+        findings.append(Finding("nodejs", "node-tz", "fail", f"Node.js TZ mismatch: {node_tz} vs expected {tz}"))
     else:
-        mode = configs.get("mode")
+        findings.append(Finding("nodejs", "node-tz", "pass", f"Node.js TZ: {node_tz}"))
+
+    node_locale = node_env.get("locale", "")
+    expected_prefix = (targets.get("locale") or "").split(".")[0].replace("_", "-")
+    if expected_prefix and node_locale.startswith(expected_prefix.split("-")[0]):
+        findings.append(Finding("nodejs", "node-locale", "pass", f"Node.js locale: {node_locale}"))
+    elif expected_prefix:
+        findings.append(Finding("nodejs", "node-locale", "fail",
+                                f"Node.js locale mismatch: {node_locale} vs expected {expected_prefix}"))
+    else:
+        findings.append(Finding("nodejs", "node-locale", "pass", f"Node.js locale: {node_locale}"))
+    return findings
+
+
+def inspect_packages() -> list[Finding]:
+    findings: list[Finding] = []
+    mirrors = plat.check_package_mirrors()
+
+    npm = mirrors.get("npm", {})
+    if npm.get("is_china_mirror"):
+        findings.append(Finding("packages", "npm-registry", "fail",
+                                f"npm uses China mirror: {npm.get('registry')}"))
+    else:
+        findings.append(Finding("packages", "npm-registry", "pass",
+                                f"npm registry: {npm.get('registry', '?')}"))
+
+    pip = mirrors.get("pip", {})
+    if pip.get("is_china_mirror"):
+        findings.append(Finding("packages", "pip-index", "fail",
+                                f"pip uses China mirror: {pip.get('index')}"))
+    else:
+        findings.append(Finding("packages", "pip-index", "pass",
+                                f"pip index: {pip.get('index', '?')}"))
+
+    brew = mirrors.get("brew", {})
+    if brew.get("is_china_mirror"):
+        findings.append(Finding("packages", "brew-mirrors", "fail", "brew uses China mirrors"))
+    elif "brew" in mirrors:
+        findings.append(Finding("packages", "brew-mirrors", "pass", "brew mirrors: default"))
+
+    # cnpm/taobao residue in ~/.npm
+    r = plat.run_shell('find ~/.npm ~/.npmrc -name "*.json" -exec grep -l "taobao\\|npmmirror\\|cnpm\\|tencent" {} \\; 2>/dev/null')
+    residue_files = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if residue_files:
+        findings.append(Finding("packages", "china-mirror-residue", "fail",
+                                f"{len(residue_files)} files with China mirror refs", residue_files[:3]))
+    else:
+        findings.append(Finding("packages", "china-mirror-residue", "pass", "No China mirror residue"))
+    return findings
+
+
+def inspect_privacy(ctx: Context) -> list[Finding]:
+    findings: list[Finding] = []
+
+    # Claude telemetry
+    tel_dir = ctx.claude_dir / "telemetry"
+    if tel_dir.exists() and any(tel_dir.iterdir()):
+        count = sum(1 for _ in tel_dir.iterdir())
+        findings.append(Finding("privacy", "telemetry", "fail", f"Claude telemetry: {count} files"))
+    else:
+        findings.append(Finding("privacy", "telemetry", "pass", "Claude telemetry clean"))
+
+    # Session residue
+    sess_dir = ctx.claude_dir / "sessions"
+    if sess_dir.exists() and any(sess_dir.iterdir()):
+        count = sum(1 for _ in sess_dir.iterdir())
+        findings.append(Finding("privacy", "session-residue", "warn", f"Claude sessions: {count} files"))
+    else:
+        findings.append(Finding("privacy", "session-residue", "pass", "Claude sessions clean"))
+
+    # Privacy env vars
+    missing = [k for k in ("DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING",
+                            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+               if os.environ.get(k) != "1"]
+    if missing:
+        findings.append(Finding("privacy", "privacy-env", "fail", f"Missing: {', '.join(missing)}"))
+    else:
+        findings.append(Finding("privacy", "privacy-env", "pass", "Privacy env aligned"))
+
+    # Shell history
+    history_hits = plat.scan_shell_history()
+    if history_hits:
+        total = sum(history_hits.values())
+        top = sorted(history_hits.items(), key=lambda x: -x[1])[:3]
+        findings.append(Finding("privacy", "shell-history", "warn",
+                                f"Shell history: {total} China domain refs",
+                                [f"{k}: {v}" for k, v in top]))
+    else:
+        findings.append(Finding("privacy", "shell-history", "pass", "Shell history clean"))
+    return findings
+
+
+def inspect_identity() -> list[Finding]:
+    findings: list[Finding] = []
+    name = plat.run_shell("git config --global user.name 2>/dev/null").stdout.strip()
+    email = plat.run_shell("git config --global user.email 2>/dev/null").stdout.strip()
+    if name or email:
+        findings.append(Finding("identity", "git-identity", "fail",
+                                f"Global git identity set: {name} <{email}>"))
+    else:
+        findings.append(Finding("identity", "git-identity", "pass", "Global git identity clean"))
+    return findings
+
+
+def inspect_clash(ctx: Context, public_ip: str | None) -> list[Finding]:
+    findings: list[Finding] = []
+    if ctx.clash_dir is None:
+        return [Finding("clash", "process", "skip", "Clash Verge not detected")]
+
+    if not plat.is_clash_running():
+        findings.append(Finding("clash", "process", "fail", "Clash Verge not running"))
+        return findings
+    findings.append(Finding("clash", "process", "pass", "Clash Verge running"))
+
+    # Mode
+    configs = plat.get_clash_api_json("configs")
+    if isinstance(configs, dict):
+        mode = configs.get("mode", "unknown")
         if mode == "direct":
             findings.append(Finding("clash", "mode", "fail", "Clash mode is direct"))
         else:
-            findings.append(Finding("clash", "mode", "pass", f"Clash mode is {mode}"))
+            findings.append(Finding("clash", "mode", "pass", f"Clash mode: {mode}"))
 
-    if global_proxy and global_proxy.get("now"):
-        findings.append(Finding("clash", "global-node", "pass", f"GLOBAL now points to {global_proxy.get('now')}"))
+    # TUN
+    tuns = plat.get_tun_interfaces()
+    runtime = ctx.clash_dir / "clash-verge.yaml"
+    runtime_text = runtime.read_text(errors="ignore") if runtime.exists() else ""
+    tun_in_config = "tun:" in runtime_text and "enable: true" in runtime_text
+    if tuns and tun_in_config:
+        findings.append(Finding("clash", "tun-enabled", "pass",
+                                f"TUN enabled, interfaces: {', '.join(tuns[:3])}"))
+    elif tuns:
+        findings.append(Finding("clash", "tun-enabled", "warn",
+                                f"TUN interfaces exist ({', '.join(tuns[:3])}) but config unclear"))
     else:
-        findings.append(Finding("clash", "global-node", "warn", "Cannot determine current GLOBAL node"))
+        findings.append(Finding("clash", "tun-enabled", "fail", "No TUN interfaces detected"))
 
-    runtime_yaml = context.clash_dir / "clash-verge.yaml"
-    runtime_text = runtime_yaml.read_text(encoding="utf-8", errors="ignore") if runtime_yaml.exists() else ""
-    missing_markers = [marker for marker in GENERIC_PUBLIC_MARKERS if marker not in runtime_text]
+    # Runtime markers
+    missing_markers = [m for m in GENERIC_PUBLIC_MARKERS if m not in runtime_text]
     if missing_markers:
-        findings.append(Finding("clash", "runtime-markers", "fail", f"Runtime config is missing markers: {', '.join(missing_markers)}"))
+        findings.append(Finding("clash", "runtime-markers", "fail",
+                                f"Missing: {', '.join(missing_markers)}"))
     else:
-        findings.append(Finding("clash", "runtime-markers", "pass", "Runtime config contains hardened DNS markers"))
+        findings.append(Finding("clash", "runtime-markers", "pass", "Runtime config has hardened markers"))
 
-    suspicious_services: list[str] = []
-    for service in list_network_services():
-        dns_servers = get_dns_servers(service)
-        if any(server in SUSPICIOUS_DNS for server in dns_servers):
-            suspicious_services.append(service)
-    if suspicious_services:
-        findings.append(Finding("clash", "system-dns-display", "fail", f"System DNS display still has suspicious values on: {', '.join(suspicious_services)}"))
-    else:
-        findings.append(Finding("clash", "system-dns-display", "pass", "System DNS display is clean"))
-
-    helper_path = context.clash_dir / "cleanup_system_dns.sh"
-    launch_agent = context.home / "Library/LaunchAgents" / LAUNCH_AGENT_NAME
-    if helper_path.exists() and launch_agent.exists():
-        findings.append(Finding("clash", "dns-cleanup-watchdog", "pass", "DNS cleanup watchdog is installed"))
-    else:
-        findings.append(Finding("clash", "dns-cleanup-watchdog", "warn", "DNS cleanup watchdog is not installed"))
-
-    google_result = run_zsh("dig +time=3 +tries=1 +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null")
-    google_lines = [line.strip().strip('"') for line in google_result.stdout.splitlines() if line.strip()]
-    google_status, google_summary = classify_google_dns(google_lines)
-    findings.append(Finding("clash", "dns-google", google_status, google_summary))
-
-    cloudflare_result = run_zsh("dig +time=3 +tries=1 +short CH TXT whoami.cloudflare @1.1.1.1 2>/dev/null")
-    cloudflare_text = cloudflare_result.stdout.strip().replace('"', "")
-    if public_ip and cloudflare_text == public_ip:
-        findings.append(Finding("clash", "dns-cloudflare", "pass", f"Cloudflare DNS whoami matches egress IP {cloudflare_text}"))
-    elif cloudflare_text:
-        findings.append(Finding("clash", "dns-cloudflare", "warn", f"Cloudflare DNS whoami returned {cloudflare_text}"))
-    else:
-        findings.append(Finding("clash", "dns-cloudflare", "fail", "Cloudflare DNS whoami returned empty output"))
-    return findings
-
-
-def inspect_public_subscription(context: Context) -> list[Finding]:
-    """检查公开订阅内容。"""
-    if not context.public_subscription_url:
-        return [Finding("vpn", "public-subscription", "skip", "Public subscription URL is not configured")]
-    text = fetch_text_url(context.public_subscription_url, timeout=12, retries=2)
-    if text is None:
-        return [Finding("vpn", "public-subscription", "warn", "Cannot fetch public subscription right now; retry later")]
-
-    missing = [marker for marker in GENERIC_PUBLIC_MARKERS if marker not in text]
-    if missing:
-        return [Finding("vpn", "public-subscription", "fail", f"Public subscription is missing markers: {', '.join(missing)}")]
-    return [Finding("vpn", "public-subscription", "pass", "Public subscription contains hardened markers")]
-
-
-def inspect_remote_vpn(context: Context) -> list[Finding]:
-    """检查远端 VPN 服务状态。"""
-    if context.vpn_root is None:
-        return [Finding("vpn", "remote-service", "skip", "VPN project root not found")]
-    if paramiko is None:
-        return [Finding("vpn", "remote-service", "skip", "paramiko is unavailable")]
-
-    builder_module = load_module(
-        context.vpn_root / "scripts" / "subscription_builder.py",
-        "builder_for_cc_check_remote",
-        context.vpn_root / "scripts",
-    )
-    deploy_module = load_module(
-        context.vpn_root / "scripts" / "deploy_6node_subscription.py",
-        "deploy_for_cc_check",
-        context.vpn_root / "scripts",
-    )
-    if deploy_module is None or not hasattr(deploy_module, "REMOTE"):
-        return [Finding("vpn", "remote-service", "fail", "Cannot load VPN deploy script metadata")]
-    if builder_module is None or not hasattr(builder_module, "build_state"):
-        return [Finding("vpn", "remote-service", "fail", "Cannot load VPN builder metadata")]
-
-    remote = deploy_module.REMOTE
-    host = remote.get("host")
-    port = int(remote.get("ssh_port", 22))
-    user = remote.get("ssh_user")
-    password = remote.get("ssh_password")
-    if not all([host, user, password]):
-        return [Finding("vpn", "remote-service", "fail", "Remote deployment credentials are incomplete")]
-
-    state = builder_module.build_state()
-    service_name = state.get("runtime", {}).get("vpn_service", {}).get("name", "vpn-service")
-    service_port = state.get("ss", {}).get("port", 8388)
-
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=host, port=port, username=user, password=password, timeout=20, banner_timeout=20)
-    except Exception as error:
-        return [Finding("vpn", "remote-service", "warn", f"Cannot connect to VPN host: {error.__class__.__name__}")]
-
-    try:
-        active = remote_exec(client, f"systemctl is-active {service_name}").strip()
-        listeners = remote_exec(client, f"ss -lntup | grep {service_port} || true")
-    finally:
-        client.close()
-
-    findings: list[Finding] = []
-    if active == "active":
-        findings.append(Finding("vpn", "remote-service", "pass", f"Remote {service_name} service is active"))
-    else:
-        findings.append(Finding("vpn", "remote-service", "fail", f"Remote {service_name} service is {active or 'unknown'}"))
-
-    if "xray" in listeners.lower():
-        findings.append(Finding("vpn", "remote-listener", "pass", f"Remote {service_port} listener belongs to Xray"))
-    elif str(service_port) in listeners:
-        findings.append(Finding("vpn", "remote-listener", "fail", f"Remote {service_port} listener is not owned by Xray"))
-    else:
-        findings.append(Finding("vpn", "remote-listener", "fail", f"Remote {service_port} listener is missing"))
-    return findings
-
-
-def remote_exec(client: Any, command: str) -> str:
-    """执行远端命令。"""
-    _stdin, stdout, stderr = client.exec_command(command, timeout=120)
-    out = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace")
-    return (out + ("\n" + err if err else "")).strip()
-
-
-def inspect_vpn(context: Context) -> list[Finding]:
-    """检查 VPN 项目与远端状态。"""
-    if context.vpn_root is None:
-        return [Finding("vpn", "project-root", "skip", "VPN project root was not detected")]
-
-    findings: list[Finding] = [Finding("vpn", "project-root", "pass", f"VPN project root detected at {context.vpn_root.name}")]
-
-    test_result = run_zsh(f'cd "{context.vpn_root}" && python3 -m unittest tests/test_subscription_builder.py', timeout=120)
-    if test_result.returncode == 0:
-        findings.append(Finding("vpn", "unit-tests", "pass", "VPN project unit tests passed"))
-    else:
-        findings.append(Finding("vpn", "unit-tests", "fail", "VPN project unit tests failed"))
-
-    generated_file = context.vpn_root / "docs/output/clash-meta.yaml"
-    if generated_file.exists():
-        text = generated_file.read_text(encoding="utf-8", errors="ignore")
-        missing = [marker for marker in GENERIC_PUBLIC_MARKERS if marker not in text]
-        if missing:
-            findings.append(Finding("vpn", "generated-subscription", "fail", f"Generated subscription is missing markers: {', '.join(missing)}"))
+    # DNS watchdog
+    if plat.PLATFORM == "darwin":
+        watchdog = ctx.clash_dir / "cleanup_system_dns.sh"
+        agent = ctx.home / "Library/LaunchAgents" / f"{plat.LAUNCH_AGENT_LABEL}.plist"
+        if watchdog.exists() and agent.exists():
+            findings.append(Finding("clash", "dns-cleanup-watchdog", "pass", "DNS watchdog installed"))
         else:
-            findings.append(Finding("vpn", "generated-subscription", "pass", "Generated subscription contains hardened markers"))
+            findings.append(Finding("clash", "dns-cleanup-watchdog", "warn", "DNS watchdog not installed"))
     else:
-        findings.append(Finding("vpn", "generated-subscription", "fail", "Generated subscription file is missing"))
-
-    findings.extend(inspect_public_subscription(context))
-    findings.extend(inspect_remote_vpn(context))
+        findings.append(Finding("clash", "dns-cleanup-watchdog", "skip", "DNS watchdog N/A on this platform"))
     return findings
 
 
-def collect_findings(context: Context) -> list[Finding]:
-    """收集所有发现。"""
+def inspect_claude(ctx: Context) -> list[Finding]:
+    findings: list[Finding] = []
+    settings = load_json(ctx.claude_dir / "settings.json")
+    if settings is None:
+        return [Finding("claude", "language", "skip", "Claude settings.json not found")]
+    lang = settings.get("language")
+    if lang and str(lang).lower() not in ("english", ""):
+        findings.append(Finding("claude", "language", "warn", f"Claude language: {lang}"))
+    else:
+        findings.append(Finding("claude", "language", "pass", "Claude language OK"))
+    return findings
+
+
+def inspect_vpn(ctx: Context) -> list[Finding]:
+    """检查 VPN 项目与远端状态。"""
+    return [Finding("vpn", item["key"], item["status"], item["summary"], item.get("details", [])) for item in vpnops.inspect(ctx.vpn_root, ctx.public_subscription_url, plat.run_shell, fetch_text_url)]
+
+
+# ---------------------------------------------------------------------------
+# Collect all findings
+# ---------------------------------------------------------------------------
+
+def collect_findings(ctx: Context, include_vpn: bool = True) -> list[Finding]:
     public_ip = fetch_public_ip()
     findings: list[Finding] = []
-    ip_quality: dict[str, Any] | None = None
+
+    # IP quality
+    ip_q: dict[str, Any] | None = None
     if public_ip:
-        ip_quality = assess_ip_quality(public_ip, context.expected_ip_type)
-        findings.append(Finding("ip-quality", "classification", ip_quality["status"], ip_quality["summary"], ip_quality["details"]))
-    target_profile = build_target_profile(context, public_ip, ip_quality)
-    findings.extend(inspect_claude(context))
-    findings.extend(inspect_system(context, target_profile))
-    findings.extend(inspect_clash(context, public_ip))
-    findings.extend(inspect_vpn(context))
-    if public_ip:
-        findings.append(Finding("network", "public-ip", "pass", f"Public egress IP is {public_ip}"))
-    else:
-        findings.append(Finding("network", "public-ip", "warn", "Public egress IP could not be determined"))
+        ip_q = assess_ip_quality(public_ip, ctx.expected_ip_type)
+        findings.append(Finding("ip-quality", "classification", ip_q["status"],
+                                ip_q["summary"], ip_q["details"]))
+
+    targets = build_target_profile(ctx, public_ip, ip_q)
+
+    findings.extend(inspect_network(public_ip))
+    findings.extend(inspect_dns(public_ip))
+    findings.extend(inspect_system(ctx, targets))
+    findings.extend(inspect_nodejs(targets))
+    findings.extend(inspect_packages())
+    findings.extend(inspect_privacy(ctx))
+    findings.extend(inspect_identity())
+    findings.extend(inspect_clash(ctx, public_ip))
+    findings.extend(inspect_claude(ctx))
+    if include_vpn:
+        findings.extend(inspect_vpn(ctx))
     return findings
 
 
+# ---------------------------------------------------------------------------
+# FIX: Repair functions
+# ---------------------------------------------------------------------------
+
 def build_env_block(targets: dict[str, str | None]) -> str:
-    """构建受管环境块。"""
     lines = [ENV_BLOCK_START]
     if targets.get("timezone"):
         lines.append(f'export TZ="{targets["timezone"]}"')
@@ -719,20 +597,16 @@ def build_env_block(targets: dict[str, str | None]) -> str:
     return "\n".join(lines)
 
 
-def upsert_env_block(path: Path, targets: dict[str, str | None]) -> None:
-    """写入受管环境块。"""
+def upsert_env_block(path: Path, targets: dict[str, str | None], dry_run: bool = False) -> str | None:
     original = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
-    pattern = re.compile(
-        rf"{re.escape(ENV_BLOCK_START)}.*?{re.escape(ENV_BLOCK_END)}\n?",
-        re.DOTALL,
-    )
-    updated = pattern.sub("", original).strip()
+    pattern = re.compile(rf"{re.escape(ENV_BLOCK_START)}.*?{re.escape(ENV_BLOCK_END)}\n?", re.DOTALL)
+    cleaned = pattern.sub("", original).strip()
     block = build_env_block(targets)
-    if updated:
-        updated = block + "\n\n" + updated + "\n"
-    else:
-        updated = block + "\n"
+    updated = block + "\n\n" + cleaned + "\n" if cleaned else block + "\n"
+    if dry_run:
+        return f"[DRY RUN] Would update {path}:\n{block}"
     path.write_text(updated, encoding="utf-8")
+    return None
 
 
 def ensure_verge_dns_toggle(clash_dir: Path) -> None:
@@ -748,329 +622,217 @@ def ensure_verge_dns_toggle(clash_dir: Path) -> None:
     verge_yaml.write_text(text, encoding="utf-8")
 
 
-def build_cleanup_script() -> str:
-    """生成 DNS 展示清理脚本。"""
-    return """#!/bin/zsh
-set -euo pipefail
-
-if ! pgrep -f "/Applications/Clash Verge.app/Contents/MacOS/clash-verge" >/dev/null 2>&1; then
-  exit 0
-fi
-
-while IFS= read -r service; do
-  service=${service#\\*}
-  service=${service## }
-  [[ -z "$service" ]] && continue
-  current=$(/usr/sbin/networksetup -getdnsservers "$service" 2>/dev/null || true)
-  if [[ "$current" == *"114.114.114.114"* ]] || [[ "$current" == *"223.5.5.5"* ]] || [[ "$current" == *"223.6.6.6"* ]] || [[ "$current" == *"119.29.29.29"* ]]; then
-    /usr/sbin/networksetup -setdnsservers "$service" Empty >/dev/null 2>&1 || true
-  fi
-done < <(/usr/sbin/networksetup -listallnetworkservices | tail -n +2)
-"""
-
-
-def build_launch_agent(script_path: Path) -> str:
-    """生成 LaunchAgent。"""
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-  <dict>
-    <key>Label</key>
-    <string>{LAUNCH_AGENT_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-      <string>/bin/zsh</string>
-      <string>{script_path}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StartInterval</key>
-    <integer>15</integer>
-    <key>StandardOutPath</key>
-    <string>/tmp/{LAUNCH_AGENT_LABEL}.out</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/{LAUNCH_AGENT_LABEL}.err</string>
-  </dict>
-</plist>
-"""
-
-
-def install_dns_cleanup(context: Context) -> list[str]:
-    """安装系统 DNS 展示清理器。"""
-    if context.clash_dir is None:
-        return ["Skip DNS cleanup installer: Clash Verge support directory not found"]
-    helper_path = context.clash_dir / "cleanup_system_dns.sh"
-    launch_agent_dir = context.home / "Library/LaunchAgents"
-    launch_agent_path = launch_agent_dir / LAUNCH_AGENT_NAME
-    helper_path.write_text(build_cleanup_script(), encoding="utf-8")
-    helper_path.chmod(0o755)
-    launch_agent_dir.mkdir(parents=True, exist_ok=True)
-    launch_agent_path.write_text(build_launch_agent(helper_path), encoding="utf-8")
-    uid = os.getuid()
-    run_zsh(f'launchctl bootout gui/{uid} "{launch_agent_path}" >/dev/null 2>&1 || true')
-    run_zsh(f'launchctl bootstrap gui/{uid} "{launch_agent_path}"')
-    run_zsh(f'launchctl kickstart -k gui/{uid}/{LAUNCH_AGENT_LABEL}')
-    return ["Installed Clash Verge DNS display cleanup watchdog"]
-
-
-def clear_suspicious_dns_display() -> list[str]:
-    """清理系统中可疑的手工 DNS 展示值。"""
-    actions: list[str] = []
-    for service in list_network_services():
-        current = get_dns_servers(service)
-        if any(server in SUSPICIOUS_DNS for server in current):
-            run_zsh(f'networksetup -setdnsservers "{service}" Empty')
-            actions.append(f"Cleared manual DNS for {service}")
-    return actions
-
-
-def remove_telemetry(context: Context) -> list[str]:
-    """清理 Claude telemetry 目录。"""
-    actions: list[str] = []
-    telemetry_dir = context.claude_dir / "telemetry"
-    if telemetry_dir.exists():
-        run_zsh(f'rm -rf "{telemetry_dir}"')
-        actions.append("Removed Claude telemetry directory")
-    return actions
-
-
-def clear_git_identity() -> list[str]:
-    """清理全局 Git 身份。"""
-    actions: list[str] = []
-    if run_zsh("git config --global user.name").stdout.strip():
-        run_zsh("git config --global --unset user.name")
-        actions.append("Unset global git user.name")
-    if run_zsh("git config --global user.email").stdout.strip():
-        run_zsh("git config --global --unset user.email")
-        actions.append("Unset global git user.email")
-    return actions
-
-
-def has_failure(findings: list[Finding], keys: set[str]) -> bool:
-    """判断是否存在指定失败项。"""
-    return any(item.status == "fail" and item.key in keys for item in findings)
-
-
-def fix_local(context: Context, findings: list[Finding] | None = None) -> list[str]:
-    """执行本地修复。"""
-    findings = findings or collect_findings(context)
-    public_ip = fetch_public_ip()
-    targets = build_target_profile(context, public_ip)
-    actions: list[str] = []
-
-    if has_failure(findings, {"timezone", "locale", "proxy-env", "privacy-env"}):
-        upsert_env_block(context.home / ".zprofile", targets)
-        upsert_env_block(context.home / ".zshrc", targets)
-        actions.append("Updated shell managed env block")
-
-    if has_failure(findings, {"telemetry"}):
-        actions.extend(remove_telemetry(context))
-
-    if has_failure(findings, {"git-identity"}):
-        actions.extend(clear_git_identity())
-
-    if context.clash_dir is not None and has_failure(findings, {"system-dns-display"}):
-        ensure_verge_dns_toggle(context.clash_dir)
-        actions.append("Set Clash Verge enable_dns_settings to false")
-
-    if has_failure(findings, {"system-dns-display"}) or any(
-        item.key == "dns-cleanup-watchdog" and item.status != "pass" for item in findings
-    ):
-        actions.extend(install_dns_cleanup(context))
-
-    if has_failure(findings, {"system-dns-display"}):
-        actions.extend(clear_suspicious_dns_display())
-    return actions
-
-
 def redact_text(text: str, tokens: list[str]) -> str:
     """脱敏输出。"""
     redacted = text
-    for token in sorted({token for token in tokens if token}, key=len, reverse=True):
+    for token in sorted({t for t in tokens if t}, key=len, reverse=True):
         redacted = redacted.replace(token, "***")
     redacted = re.sub(r'("password"\s*:\s*")[^"]+(")', r'\1***\2', redacted)
     redacted = re.sub(r"(-password\s+)\S+", r"\1***", redacted)
     return redacted
 
 
-def vpn_redaction_tokens(vpn_root: Path) -> list[str]:
-    """收集 VPN 相关敏感词。"""
-    tokens: list[str] = []
-    builder = load_module(vpn_root / "scripts" / "subscription_builder.py", "builder_redact", vpn_root / "scripts")
-    deployer = load_module(vpn_root / "scripts" / "deploy_6node_subscription.py", "deployer_redact", vpn_root / "scripts")
-    if builder is not None:
-        tokens.extend(
-            [
-                getattr(builder, "SS_PASSWORD", ""),
-                getattr(builder, "SUBSCRIPTION_ID", ""),
-            ]
-        )
-    if deployer is not None and hasattr(deployer, "REMOTE"):
-        remote = deployer.REMOTE
-        tokens.extend([remote.get("ssh_password", ""), remote.get("panel_pass", "")])
-    return [token for token in tokens if token]
+def has_failure(findings: list[Finding], keys: set[str]) -> bool:
+    return any(f.status == "fail" and f.key in keys for f in findings)
 
 
-def should_run_deploy(findings: list[Finding]) -> bool:
-    """判断是否需要跑 VPN 部署。"""
-    repair_keys = {"public-subscription", "remote-service", "remote-listener"}
-    return any(item.status == "fail" and item.key in repair_keys for item in findings)
-
-
-def fix_vpn(context: Context, findings: list[Finding] | None = None) -> list[str]:
-    """执行 VPN 修复。"""
-    if context.vpn_root is None:
-        return ["Skip VPN fixes: VPN project root not found"]
-
-    findings = findings or inspect_vpn(context)
+def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
+    findings = findings or collect_findings(ctx, include_vpn=False)
+    public_ip = fetch_public_ip()
+    targets = build_target_profile(ctx, public_ip)
     actions: list[str] = []
-    if has_failure(findings, {"generated-subscription", "public-subscription", "remote-service", "remote-listener"}):
-        run_zsh(f'cd "{context.vpn_root}" && python3 scripts/subscription_builder.py', timeout=120)
-        actions.append("Regenerated VPN subscription outputs")
 
-    if should_run_deploy(findings):
-        deploy_cmd = f'cd "{context.vpn_root}" && python3 scripts/deploy_6node_subscription.py'
-        result = run_zsh(deploy_cmd, timeout=1800)
-        if result.returncode != 0:
-            secret_tokens = vpn_redaction_tokens(context.vpn_root)
-            output = redact_text(result.stdout + "\n" + result.stderr, secret_tokens)
-            raise RuntimeError(f"VPN deploy failed:\n{output[-4000:]}")
-        actions.append("Ran VPN deploy script to sync public and remote state")
-    else:
-        actions.append("VPN deploy was not needed")
-    return actions
+    # Shell env block
+    if has_failure(findings, {"timezone", "locale", "proxy-env", "privacy-env"}):
+        for path in plat.get_shell_profile_paths():
+            msg = upsert_env_block(path, targets, ctx.dry_run)
+            if msg:
+                actions.append(msg)
+            else:
+                actions.append(f"Updated {path.name} env block")
 
+    # Telemetry
+    if has_failure(findings, {"telemetry"}):
+        tel = ctx.claude_dir / "telemetry"
+        if tel.exists():
+            if ctx.dry_run:
+                count = sum(1 for _ in tel.iterdir())
+                actions.append(f"[DRY RUN] Would remove {tel} ({count} files)")
+            else:
+                plat.run_shell(f'rm -rf "{tel}"')
+                actions.append("Removed Claude telemetry")
 
-def print_report(findings: list[Finding]) -> None:
-    """输出文本报告。"""
-    grouped: dict[str, list[Finding]] = {}
-    for item in findings:
-        grouped.setdefault(item.group, []).append(item)
-    for group in sorted(grouped):
-        print(f"[{group}]")
-        for item in grouped[group]:
-            print(f"- {item.status.upper():<4} {item.key}: {item.summary}")
-            for detail in item.details:
-                print(f"  · {detail}")
-
-
-def failures(findings: list[Finding]) -> int:
-    """统计失败项。"""
-    return sum(1 for item in findings if item.status == "fail")
-
-
-def command_inspect(context: Context, as_json: bool) -> int:
-    """执行 inspect。"""
-    findings = collect_findings(context)
-    if as_json:
-        print(json.dumps([item.to_dict() for item in findings], ensure_ascii=False, indent=2))
-    else:
-        print_report(findings)
-    return 0 if failures(findings) == 0 else 2
-
-
-def command_fix_local(context: Context) -> int:
-    """执行本地修复。"""
-    actions = fix_local(context)
-    for action in actions or ["No local repairs needed"]:
-        print(action)
-    return 0
-
-
-def command_fix_vpn(context: Context) -> int:
-    """执行 VPN 修复。"""
-    actions = fix_vpn(context)
-    for action in actions or ["No VPN repairs needed"]:
-        print(action)
-    return 0
-
-
-def command_verify(context: Context, as_json: bool) -> int:
-    """执行 verify。"""
-    return command_inspect(context, as_json)
-
-
-def command_full(context: Context, as_json: bool) -> int:
-    """执行完整流程。"""
-    initial = collect_findings(context)
-    if failures(initial) == 0:
-        if as_json:
-            print(json.dumps([item.to_dict() for item in initial], ensure_ascii=False, indent=2))
+    # Git
+    if has_failure(findings, {"git-identity"}):
+        if ctx.dry_run:
+            actions.append("[DRY RUN] Would unset git user.name and user.email")
         else:
-            print_report(initial)
-        return 0
+            plat.run_shell("git config --global --unset user.name 2>/dev/null")
+            plat.run_shell("git config --global --unset user.email 2>/dev/null")
+            actions.append("Cleared global git identity")
 
-    local_fail = any(item.group in {"claude", "system", "clash"} and item.status == "fail" for item in initial)
-    vpn_fail = any(item.group == "vpn" and item.status == "fail" for item in initial)
-    if local_fail:
-        for action in fix_local(context, initial):
-            print(action)
-    if vpn_fail:
-        for action in fix_vpn(context, initial):
-            print(action)
-    return command_verify(context, as_json)
+    # Clash Verge DNS toggle
+    if ctx.clash_dir is not None and has_failure(findings, {"system-dns-display"}):
+        if ctx.dry_run:
+            actions.append("[DRY RUN] Would set Clash Verge enable_dns_settings to false")
+        else:
+            ensure_verge_dns_toggle(ctx.clash_dir)
+            actions.append("Set Clash Verge enable_dns_settings to false")
+
+    # DNS display
+    if has_failure(findings, {"system-dns-display"}):
+        dns_map = plat.get_dns_servers()
+        for svc, servers in dns_map.items():
+            if any(s in plat.SUSPICIOUS_DNS for s in servers):
+                if ctx.dry_run:
+                    actions.append(f"[DRY RUN] Would clear suspicious DNS for {svc}")
+                else:
+                    plat.clear_dns_for_service(svc)
+                    actions.append(f"Cleared DNS for {svc}")
+
+    # DNS watchdog
+    if plat.PLATFORM == "darwin" and ctx.clash_dir and (
+        has_failure(findings, {"system-dns-display"}) or
+        any(f.key == "dns-cleanup-watchdog" and f.status != "pass" for f in findings)
+    ):
+        if ctx.dry_run:
+            actions.append("[DRY RUN] Would install DNS cleanup watchdog")
+        else:
+            actions.extend(plat.install_dns_watchdog(ctx.clash_dir))
+
+    return actions or ["No local repairs needed"]
 
 
-def command_fix_system_dns_display(context: Context, quiet: bool) -> int:
-    """只执行系统 DNS 展示清理。"""
-    actions = clear_suspicious_dns_display()
-    if not quiet:
-        for action in actions or ["No suspicious system DNS values found"]:
-            print(action)
-    return 0
+def fix_vpn(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
+    """执行 VPN 修复（含脱敏输出）。"""
+    findings = findings or inspect_vpn(ctx)
+    return vpnops.fix(ctx.vpn_root, findings, ctx.dry_run, plat.run_shell, redact_text)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """构建参数解析器。"""
-    parser = argparse.ArgumentParser(description="CC-check skill orchestrator")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("inspect", "fix-local", "fix-vpn", "verify", "full"):
-        subparser = subparsers.add_parser(name)
-        subparser.add_argument("--vpn-root", help="Override VPN project root")
-        subparser.add_argument("--clash-dir", help="Override Clash Verge support directory")
-        subparser.add_argument("--public-subscription-url", help="Override public subscription URL")
-        subparser.add_argument("--target-timezone", help="Expected timezone for environment alignment")
-        subparser.add_argument("--target-locale", help="Expected locale, e.g. en_US.UTF-8")
-        subparser.add_argument("--target-language", help="Expected language, e.g. en_US")
-        subparser.add_argument("--proxy-url", help="Expected proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7898")
-        subparser.add_argument("--expected-ip-type", default="residential", help="Expected public IP type, default residential")
-        subparser.add_argument("--json", action="store_true", help="Print findings as JSON")
-    dns_parser = subparsers.add_parser("fix-system-dns-display")
-    dns_parser.add_argument("--vpn-root", help="Override VPN project root")
-    dns_parser.add_argument("--clash-dir", help="Override Clash Verge support directory")
-    dns_parser.add_argument("--public-subscription-url", help="Override public subscription URL")
-    dns_parser.add_argument("--target-timezone", help="Expected timezone for environment alignment")
-    dns_parser.add_argument("--target-locale", help="Expected locale, e.g. en_US.UTF-8")
-    dns_parser.add_argument("--target-language", help="Expected language, e.g. en_US")
-    dns_parser.add_argument("--proxy-url", help="Expected proxy URL, e.g. http://127.0.0.1:7897 or socks5://127.0.0.1:7898")
-    dns_parser.add_argument("--expected-ip-type", default="residential", help="Expected public IP type, default residential")
-    dns_parser.add_argument("--quiet", action="store_true", help="Suppress normal output")
-    return parser
+# ---------------------------------------------------------------------------
+# Report & CLI
+# ---------------------------------------------------------------------------
+
+def print_report(findings: list[Finding], show_score: bool = True) -> None:
+    grouped: dict[str, list[Finding]] = {}
+    for f in findings:
+        grouped.setdefault(f.group, []).append(f)
+
+    status_icon = {"pass": "✅", "fail": "❌", "warn": "⚠️ ", "skip": "⏭️ "}
+
+    for group in sorted(grouped):
+        print(f"\n[{group}]")
+        for f in grouped[group]:
+            icon = status_icon.get(f.status, "?")
+            print(f"  {icon} {f.key}: {f.summary}")
+            for d in f.details:
+                print(f"      · {d}")
+
+    if show_score:
+        report = compute_score(findings)
+        print(format_score_report(report))
+
+    fail_count = sum(1 for f in findings if f.status == "fail")
+    warn_count = sum(1 for f in findings if f.status == "warn")
+    pass_count = sum(1 for f in findings if f.status == "pass")
+    print(f"Summary: {pass_count} pass, {warn_count} warn, {fail_count} fail")
 
 
 def main() -> int:
-    """程序入口。"""
-    parser = build_parser()
+    parser = argparse.ArgumentParser(description="CC-check v2 — Cross-platform environment auditor")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    for name in ("inspect", "fix-local", "fix-vpn", "verify", "full"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--vpn-root", help="Override VPN project root")
+        sp.add_argument("--clash-dir", help="Override Clash Verge directory")
+        sp.add_argument("--public-subscription-url", help="Override subscription URL")
+        sp.add_argument("--target-timezone", help="Expected timezone (Olson)")
+        sp.add_argument("--target-locale", help="Expected locale, e.g. en_US.UTF-8")
+        sp.add_argument("--target-language", help="Expected language, e.g. en_US")
+        sp.add_argument("--proxy-url", help="Expected proxy URL")
+        sp.add_argument("--expected-ip-type", default="residential", help="Expected IP type")
+        sp.add_argument("--json", action="store_true", help="Output as JSON")
+        sp.add_argument("--dry-run", action="store_true", help="Preview changes without applying")
+
+    dns_sp = sub.add_parser("fix-system-dns-display")
+    dns_sp.add_argument("--quiet", action="store_true")
+    dns_sp.add_argument("--dry-run", action="store_true")
+
     args = parser.parse_args()
-    context = make_context(args)
+    ctx = make_context(args)
+
     try:
         if args.command == "inspect":
-            return command_inspect(context, args.json)
+            findings = collect_findings(ctx)
+            if getattr(args, "json", False):
+                print(json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2))
+            else:
+                print_report(findings)
+            return 0 if not any(f.status == "fail" for f in findings) else 2
+
         if args.command == "fix-local":
-            return command_fix_local(context)
+            for a in fix_local(ctx):
+                print(a)
+            return 0
+
         if args.command == "fix-vpn":
-            return command_fix_vpn(context)
+            for a in fix_vpn(ctx):
+                print(a)
+            return 0
+
         if args.command == "verify":
-            return command_verify(context, args.json)
+            findings = collect_findings(ctx)
+            if getattr(args, "json", False):
+                print(json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2))
+            else:
+                print_report(findings)
+            return 0 if not any(f.status == "fail" for f in findings) else 2
+
         if args.command == "full":
-            return command_full(context, args.json)
+            print("=== Phase 1: Inspect ===")
+            initial = collect_findings(ctx)
+            fail_count = sum(1 for f in initial if f.status == "fail")
+            if fail_count == 0:
+                print_report(initial)
+                return 0
+
+            print_report(initial, show_score=False)
+            print(f"\n=== Phase 2: Fix ({fail_count} issues) ===")
+            local_fail = any(f.group in {"claude", "system", "clash", "dns", "privacy", "identity", "packages"} and f.status == "fail" for f in initial)
+            vpn_fail = any(f.group == "vpn" and f.status == "fail" for f in initial)
+            if local_fail:
+                for a in fix_local(ctx, initial):
+                    print(f"  {a}")
+            if vpn_fail:
+                for a in fix_vpn(ctx, initial):
+                    print(f"  {a}")
+
+            print("\n=== Phase 3: Verify ===")
+            final = collect_findings(ctx)
+            print_report(final)
+            return 0 if not any(f.status == "fail" for f in final) else 2
+
         if args.command == "fix-system-dns-display":
-            return command_fix_system_dns_display(context, args.quiet)
-        parser.error(f"Unknown command: {args.command}")
+            dns_map = plat.get_dns_servers()
+            actions = []
+            for svc, servers in dns_map.items():
+                if any(s in plat.SUSPICIOUS_DNS for s in servers):
+                    if getattr(args, "dry_run", False):
+                        actions.append(f"[DRY RUN] Would clear DNS for {svc}")
+                    else:
+                        plat.clear_dns_for_service(svc)
+                        actions.append(f"Cleared DNS for {svc}")
+            if not getattr(args, "quiet", False):
+                for a in actions or ["No suspicious DNS found"]:
+                    print(a)
+            return 0
+
+    except Exception as exc:
+        print(f"CC-check failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return 1
-    except Exception as error:
-        print(f"CC-check failed: {error.__class__.__name__}: {error}", file=sys.stderr)
-        return 1
+
+    return 1
 
 
 if __name__ == "__main__":

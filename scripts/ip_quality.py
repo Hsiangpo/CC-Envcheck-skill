@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""IP 质量检测辅助模块。"""
+"""IP 质量检测辅助模块（增强版）。
+
+多权威渠道评估 IP 类型、风险值、是否真实住宅。
+"""
 
 from __future__ import annotations
 
@@ -11,13 +14,31 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+GOOD_IP_TYPES = {"residential", "mobile", "isp"}
+BAD_IP_TYPES = {"hosting", "vpn", "proxy", "datacenter", "tor"}
 
-GOOD_IP_TYPES = {"residential", "mobile"}
-BAD_IP_TYPES = {"hosting", "vpn", "proxy"}
+# 真实住宅 ISP 白名单（美国常见家宽）
+US_RESIDENTIAL_ISPS = {
+    "comcast", "xfinity", "at&t", "verizon", "spectrum", "cox",
+    "centurylink", "frontier", "windstream", "mediacom", "optimum",
+    "charter", "altice", "suddenlink", "wow!", "rcn", "astound",
+}
+
+IANA_TIMEZONE_TO_LOCALE = {
+    "US": ("en_US.UTF-8", "en_US"),
+    "GB": ("en_GB.UTF-8", "en_GB"),
+    "CA": ("en_CA.UTF-8", "en_CA"),
+    "AU": ("en_AU.UTF-8", "en_AU"),
+    "DE": ("de_DE.UTF-8", "de_DE"),
+    "FR": ("fr_FR.UTF-8", "fr_FR"),
+    "JP": ("ja_JP.UTF-8", "ja_JP"),
+    "KR": ("ko_KR.UTF-8", "ko_KR"),
+    "SG": ("en_SG.UTF-8", "en_SG"),
+    "HK": ("en_HK.UTF-8", "en_HK"),
+}
 
 
 def fetch_json(url: str, timeout: int = 8) -> dict[str, Any] | None:
-    """读取 JSON 接口。"""
     try:
         with urlopen(url, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8", errors="ignore"))
@@ -26,22 +47,17 @@ def fetch_json(url: str, timeout: int = 8) -> dict[str, Any] | None:
 
 
 def run_whois(ip: str) -> str:
-    """读取 whois 文本。"""
     try:
         result = subprocess.run(
             ["/usr/bin/env", "whois", ip],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
+            capture_output=True, text=True, timeout=20, check=False,
         )
         return (result.stdout or "")[:6000]
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         return ""
 
 
 def parse_whois_country(text: str) -> str | None:
-    """提取 whois country。"""
     for line in text.splitlines():
         if line.lower().startswith("country:"):
             value = line.split(":", 1)[1].strip()
@@ -52,14 +68,24 @@ def parse_whois_country(text: str) -> str | None:
 
 def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[str, Any]:
     """用多权威渠道评估 IP 质量。"""
+    # 1. ipinfo.io
     ipinfo = fetch_json(f"https://ipinfo.io/{ip}/json")
+
+    # 2. ip-api.com
     ip_api = fetch_json(
-        f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,timezone,isp,org,as,asname,proxy,hosting,mobile,query"
+        f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,"
+        f"timezone,isp,org,as,asname,proxy,hosting,mobile,query"
     )
+
+    # 3. proxycheck.io
     proxycheck = fetch_json(
         f"https://proxycheck.io/v2/{ip}?vpn=1&asn=1&risk=1&port=1&seen=1&days=7&tag=cc-check"
     )
+
+    # 4. bgpview.io
     bgpview = fetch_json(f"https://api.bgpview.io/ip/{ip}")
+
+    # 5. whois
     whois_text = run_whois(ip)
     whois_country = parse_whois_country(whois_text)
 
@@ -67,50 +93,52 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
     if proxycheck and proxycheck.get("status") == "ok":
         proxy_data = proxycheck.get(ip, {})
 
+    # Extract geo
     timezone = None
-    if ipinfo and ipinfo.get("timezone"):
-        timezone = str(ipinfo["timezone"])
-    elif ip_api and ip_api.get("timezone"):
-        timezone = str(ip_api["timezone"])
-
     country = None
-    if ipinfo and ipinfo.get("country"):
-        country = str(ipinfo["country"])
-    elif ip_api and ip_api.get("country"):
-        country = str(ip_api["country"])
+    country_code = None
+    city = None
+    isp_name = ""
 
-    locale = "en_US.UTF-8" if country == "US" else None
-    language = "en_US" if country == "US" else None
+    if ipinfo:
+        timezone = ipinfo.get("timezone")
+        country_code = ipinfo.get("country")
+        city = ipinfo.get("city")
+        isp_name = ipinfo.get("org", "")
+    if ip_api and ip_api.get("status") == "success":
+        timezone = timezone or ip_api.get("timezone")
+        country = ip_api.get("country")
+        country_code = country_code or ip_api.get("countryCode")
+        city = city or ip_api.get("city")
+        isp_name = isp_name or ip_api.get("isp", "")
 
+    # Derive locale from country
+    locale_pair = IANA_TIMEZONE_TO_LOCALE.get(country_code or "", (None, None))
+    target_locale = locale_pair[0]
+    target_language = locale_pair[1]
+
+    # Build details
     details: list[str] = []
     if ipinfo:
         details.append(
-            "ipinfo:"
-            f" country={ipinfo.get('country', '?')}"
-            f" timezone={ipinfo.get('timezone', '?')}"
-            f" org={ipinfo.get('org', '?')}"
+            f"ipinfo: country={ipinfo.get('country', '?')} city={ipinfo.get('city', '?')} "
+            f"tz={ipinfo.get('timezone', '?')} org={ipinfo.get('org', '?')}"
         )
     else:
         details.append("ipinfo: unavailable")
 
     if ip_api and ip_api.get("status") == "success":
         details.append(
-            "ip-api:"
-            f" proxy={ip_api.get('proxy', '?')}"
-            f" hosting={ip_api.get('hosting', '?')}"
-            f" mobile={ip_api.get('mobile', '?')}"
-            f" isp={ip_api.get('isp', '?')}"
+            f"ip-api: proxy={ip_api.get('proxy', '?')} hosting={ip_api.get('hosting', '?')} "
+            f"mobile={ip_api.get('mobile', '?')} isp={ip_api.get('isp', '?')}"
         )
     else:
         details.append("ip-api: unavailable")
 
     if isinstance(proxy_data, dict) and proxy_data:
         details.append(
-            "proxycheck:"
-            f" proxy={proxy_data.get('proxy', '?')}"
-            f" type={proxy_data.get('type', '?')}"
-            f" risk={proxy_data.get('risk', '?')}"
-            f" provider={proxy_data.get('provider', '?')}"
+            f"proxycheck: proxy={proxy_data.get('proxy', '?')} type={proxy_data.get('type', '?')} "
+            f"risk={proxy_data.get('risk', '?')} provider={proxy_data.get('provider', '?')}"
         )
     else:
         details.append("proxycheck: unavailable")
@@ -119,54 +147,81 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
         data = bgpview.get("data", {})
         rir = data.get("rir_allocation", {})
         details.append(
-            "bgpview:"
-            f" prefix_count={len(data.get('prefixes', []) or [])}"
-            f" rir={rir.get('rir_name', '?')}"
+            f"bgpview: prefix_count={len(data.get('prefixes', []) or [])} "
+            f"rir={rir.get('rir_name', '?')}"
         )
     else:
         details.append("bgpview: unavailable")
 
     details.append(f"whois: country={whois_country or '?'}")
 
+    # Classify
     status = "pass"
     summary = "IP quality looks acceptable"
     recommendations: list[str] = []
 
     proxy_flag = str(proxy_data.get("proxy", "")).lower() == "yes" if isinstance(proxy_data, dict) else False
     ip_type = str(proxy_data.get("type", "")).lower() if isinstance(proxy_data, dict) else ""
+    risk_score = int(proxy_data.get("risk", 0)) if isinstance(proxy_data, dict) else 0
     hosting = bool(ip_api.get("hosting")) if isinstance(ip_api, dict) and ip_api.get("status") == "success" else False
     api_proxy = bool(ip_api.get("proxy")) if isinstance(ip_api, dict) and ip_api.get("status") == "success" else False
 
+    # Hard fail: flagged as proxy/VPN/hosting
     if proxy_flag or api_proxy or hosting:
         status = "fail"
-        summary = "IP is flagged as proxy/VPN/hosting by at least one authority"
-        recommendations.append("建议升级为真实住宅/家宽 IP，再进行高敏感环境使用。")
+        summary = f"IP is flagged as proxy/VPN/hosting by authority sources (type={ip_type}, risk={risk_score})"
+        recommendations.append(
+            f"当前 IP 被标记为 {ip_type or 'proxy/hosting'}。"
+            "请更换为真实住宅宽带 IP（如美国 Comcast/AT&T/Spectrum 家宽），"
+            "伪住宅（IDC 隧道包装）同样会被高敏感 API 识别。"
+        )
+
+    # Residential type check
     elif expected_ip_type == "residential":
         if ip_type in BAD_IP_TYPES:
             status = "fail"
-            summary = f"IP type is {ip_type}, not residential"
-            recommendations.append("建议升级为真实住宅/家宽 IP，再进行高敏感环境使用。")
+            summary = f"IP type is '{ip_type}', not residential"
+            recommendations.append("请更换为真实住宅宽带 IP，当前 IP 类型不符合要求。")
         elif ip_type and ip_type not in GOOD_IP_TYPES:
             status = "warn"
-            summary = f"IP type is {ip_type}, not confidently residential"
-            recommendations.append("建议继续用更多权威渠道复核，必要时升级为真实住宅/家宽 IP。")
+            summary = f"IP type is '{ip_type}', not confidently residential"
+            recommendations.append("建议用更多权威渠道复核，必要时升级为真实住宅 IP。")
         elif not ip_type:
             status = "warn"
             summary = "IP type could not be confidently classified"
-            recommendations.append("建议继续用更多权威渠道复核，必要时升级为真实住宅/家宽 IP。")
+            recommendations.append("建议用更多渠道复核 IP 类型。")
 
-    if country and whois_country and country != whois_country:
+    # ISP sanity: check if ISP looks like real residential
+    if isp_name and expected_ip_type == "residential":
+        isp_lower = isp_name.lower()
+        is_known_resi = any(resi in isp_lower for resi in US_RESIDENTIAL_ISPS)
+        if not is_known_resi and status == "pass":
+            # Not a known residential ISP, but not flagged either
+            details.append(f"isp-check: '{isp_name}' is not a known US residential ISP")
+
+    # Risk score warning
+    if risk_score >= 66 and status != "fail":
+        status = "warn"
+        summary = f"IP risk score is high ({risk_score}/100)"
+        recommendations.append(f"风险评分 {risk_score}/100 偏高，建议更换更纯净的家宽节点。")
+
+    # Cross-check country
+    if country_code and whois_country and country_code != whois_country:
         if status == "pass":
             status = "warn"
-        recommendations.append(f"geo country={country} but whois country={whois_country}, 需要人工复核。")
+        recommendations.append(f"geo country={country_code} vs whois country={whois_country}，建议人工复核。")
 
     return {
         "status": status,
         "summary": summary,
         "details": details + recommendations,
         "target_timezone": timezone,
-        "target_locale": locale,
-        "target_language": language,
+        "target_locale": target_locale,
+        "target_language": target_language,
         "country": country,
+        "country_code": country_code,
+        "city": city,
         "ip_type": ip_type or None,
+        "risk_score": risk_score,
+        "isp": isp_name,
     }

@@ -1,108 +1,151 @@
 ---
 name: cc-check
-description: Use when auditing or repairing Claude Code, Clash Verge, system DNS display, public IP quality, or VPN subscription and deployment state across Macs, especially after network drift, anti-detect setup changes, or VPN subscription updates.
+description: Use when auditing or repairing Claude Code proxy alignment, DNS leaks, system fingerprint, public IP quality, package mirrors, or VPN state, especially on macOS and in environments that use Clash Verge or a compatible VPN project.
 ---
 
 # CC Check
 
 ## Overview
 
-Use this skill to run a reusable Claude/Clash/VPN anti-detect workflow across Macs. The default mode is: inspect first, repair only failing items, then verify again.
+Claude Code environment auditor and hardener. It inspects the current machine first, derives a target profile from the public IP when possible, and only repairs items that inspection marks as failed.
+
+Current reality:
+
+- macOS support is the most complete
+- Linux and Windows have partial inspection coverage
+- VPN project checks work only for supported project layouts, otherwise they cleanly skip
 
 ## When to Use
 
-Use this skill when any of these are true:
-
 - Claude Code starts failing after proxy, DNS, or locale changes
-- A new Mac needs to be aligned with the target VPN environment
+- A new machine needs to be aligned with the target VPN environment
 - Clash Verge shows suspicious DNS values such as `114.114.114.114`
+- You want a redacted end-to-end audit with a score, not ad hoc shell checks
 - You updated a VPN subscription or node and need to confirm local + public + remote state
-- You want one redacted end-to-end report instead of ad hoc shell checks
+- You want to check if any package managers (npm/pip/brew) are using China mirrors
+- You need to verify Node.js runtime timezone/locale alignment
 
-Do not use this skill for browser anti-detect work, app UI spoofing, or unrelated VPN providers.
+Do NOT use this skill for:
+- Browser anti-detect work (use dedicated fingerprint browser tools)
+- App UI spoofing
+- Unrelated VPN providers
 
 ## Workflow
 
-1. Run the bundled script in `inspect` mode first.
-2. Review the grouped findings:
-   - `pass` means no action needed
-   - `fail` means repair is expected
-   - `warn` means low-risk or preference-sensitive; do not auto-fix unless the script explicitly supports it
-3. If local items fail, run `fix-local`.
-4. If VPN project or remote deployment items fail, run `fix-vpn`.
-5. Always run `verify` after any fix pass.
+1. **Inspect**: Run `inspect` to get a full audit with 100-point score.
+2. **Review**: Pass / Fail / Warn / Skip grouped by category.
+3. **Fix**: Run `fix-local` for local items, `fix-vpn` for VPN/remote items.
+4. **Verify**: Run `verify` to confirm repairs.
+5. **Full**: Or run `full` for the complete inspect → fix → verify cycle.
 
-Use `full` only when you want the whole inspect -> repair -> verify sequence in one run.
-`fix-local` and `fix-vpn` are detection-driven: they should only touch items that inspection marked as failed or missing.
+Use `--dry-run` on any fix command to preview changes without applying them.
 
 ## Commands
 
-Run the orchestrator directly:
-
 ```bash
-python3 <path-to-skill>/scripts/cc_check.py inspect
-python3 <path-to-skill>/scripts/cc_check.py inspect --expected-ip-type residential
-python3 <path-to-skill>/scripts/cc_check.py fix-local
-python3 <path-to-skill>/scripts/cc_check.py fix-vpn
-python3 <path-to-skill>/scripts/cc_check.py verify
-python3 <path-to-skill>/scripts/cc_check.py full
+# Inspect with score
+python3 <path>/scripts/cc_check.py inspect
+
+# Inspect with JSON output
+python3 <path>/scripts/cc_check.py inspect --json
+
+# Preview fixes without applying
+python3 <path>/scripts/cc_check.py fix-local --dry-run
+
+# Apply fixes
+python3 <path>/scripts/cc_check.py fix-local
+
+# Full cycle
+python3 <path>/scripts/cc_check.py full
+
+# With overrides
+python3 <path>/scripts/cc_check.py inspect \
+  --target-timezone America/Los_Angeles \
+  --target-locale en_US.UTF-8 \
+  --proxy-url http://127.0.0.1:7897 \
+  --expected-ip-type residential
 ```
 
-Useful overrides:
+## Audit Groups
 
-```bash
-python3 <path-to-skill>/scripts/cc_check.py inspect --json
-python3 <path-to-skill>/scripts/cc_check.py inspect --vpn-root /custom/path/vpn-project
-python3 <path-to-skill>/scripts/cc_check.py inspect --target-timezone <olson-tz> --target-locale <locale> --proxy-url <proxy-url>
-python3 <path-to-skill>/scripts/cc_check.py full --public-subscription-url "https://example.com/subscription.yaml"
+The skill currently groups checks into:
+
+- `network`: public IP, multi-source IP, IPv6 leakage
+- `ip-quality`: residential / proxy / hosting confidence
+- `dns`: actual DNS path and displayed DNS state
+- `system`: timezone, locale, proxy env, input method, hostname and related machine signals
+- `nodejs`: Node runtime timezone and locale when Node is available
+- `packages`: npm / pip / brew mirror checks
+- `privacy`: telemetry residue and privacy env
+- `identity`: git identity
+- `clash`: process, mode, TUN, runtime markers, DNS watchdog
+- `claude`: Claude settings
+- `vpn`: supported VPN project and remote deployment checks when a compatible project is detected
+
+## Scoring
+
+Each check has a weight. The total is aggregated into a percentage and letter grade.
+
 ```
-
-## What the Script Checks
-
-- Claude settings, telemetry/session residue, and preference-sensitive fields
-- Locale, timezone, proxy env, and global git identity
-- Public IP quality via multiple non-trivial channels
-- Current macOS input source
-- Clash Verge runtime mode, active profile, actual DNS path, and system DNS display drift
-- The local DNS cleanup watchdog for Clash Verge display-only overrides
-- Detected VPN project source consistency, generated outputs, public subscription content, and remote service status when a compatible project is present
+╔════════════════════════════════════════════╗
+║  CC-Check Score:  87 / 100  Grade: B  (87.0%)  ║
+╠════════════════════════════════════════════╣
+║  network      8/15   ████████░░  85.0%  ║
+║  dns         16/16   ██████████ 100.0%  ║
+║  system      25/25   ██████████ 100.0%  ║
+║  ...                                      ║
+╚════════════════════════════════════════════╝
+```
 
 ## Fix Policy
 
-`fix-local` may safely mutate:
+### `fix-local` may safely mutate:
+- Shell profile files (`~/.zprofile`, `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, or PowerShell `$PROFILE`)
+- `~/.claude/` telemetry data
+- Global git config (`user.name`, `user.email`)
+- System DNS display values for services with suspicious Chinese DNS
+- DNS cleanup watchdog (macOS LaunchAgent)
 
-- `~/.zprofile`
-- `~/.zshrc`
-- `~/.claude/`
-- discovered Clash Verge support files under the current user’s Library
-- a generated LaunchAgent used to clear system-DNS display drift when needed
-- manual DNS display values for network services that were overwritten by Clash Verge with suspicious public Chinese resolvers
+### `fix-vpn` may safely mutate:
+- Generated files in the detected VPN project root
+- Public subscription state via detected deploy script
+- Remote VPN service state on configured host
 
-`fix-local` should only mutate items that inspection marked as `fail`. It must not rewrite already-healthy items just because they are part of the workflow.
+Both fix commands only touch items that inspection marked as `fail`.
 
-`fix-vpn` may safely mutate:
-
-- generated files in the detected VPN project root
-- public subscription state via the detected deploy script
-- remote VPN service state on the configured host
-
-`fix-vpn` should only run deployment actions when inspection shows the generated subscription, public subscription, or remote service/listener is actually out of sync.
-
-## Low-Risk Findings
-
-These should be reported as `warn`, not auto-fixed by default:
+## Low-Risk Findings (reported as `warn`, not auto-fixed)
 
 - Claude settings language is Chinese
-- Active input method is SCIM / Pinyin
-- Google DNS whoami returns a Cloudflare/anycast Asia PoP instead of a US PoP, as long as the actual DNS path is no longer using China ISP resolvers
-- IP quality cannot be confidently classified because some public authority channels are unavailable, but the available channels do not flag the IP as proxy/hosting
+- Active input method is Pinyin / SCIM
+- Google DNS whoami returns Cloudflare Asia PoP
+- IP quality uncertain but not flagged
+- Shell history contains China domain references
+- System measurement units / time format mismatch
 
 ## Privacy Rules
 
-- Never print or persist raw passwords, tokens, private keys, or subscription secrets in normal output.
-- Never dump full secret-bearing config files.
-- Summaries must redact sensitive values as `***`.
-- Remote deployment logs must be captured and sanitized before any failure output is shown.
+- Never print passwords, tokens, private keys, or subscription secrets
+- Never dump full secret-bearing config files
+- Summaries must redact sensitive values as `***`
+- Remote deployment logs are sanitized before output
+
+## Cross-Platform Notes
+
+- **macOS**: fullest inspection and repair support
+- **Linux**: inspection support is broader than repair support
+- **Windows**: inspection support exists for selected checks, repair support is limited
+
+Do not promise full parity across platforms unless the implementation actually has it.
+
+## Architecture
+
+```
+scripts/
+├── cc_check.py        # Main orchestrator & CLI
+├── ip_quality.py      # Multi-channel IP quality assessment
+├── platform_ops.py    # Cross-platform abstraction layer
+└── scoring.py         # 100-point scoring system
+```
 
 ## References
 
