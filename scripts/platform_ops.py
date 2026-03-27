@@ -1098,3 +1098,251 @@ def _build_launchagent_plist(script_path: Path) -> str:
   </dict>
 </plist>
 """
+
+
+# ---------------------------------------------------------------------------
+# Extended checks: GOPROXY, Docker, Git remotes, VS Code, SSH, Fonts
+# ---------------------------------------------------------------------------
+
+CHINA_MIRROR_PATTERNS = [
+    "goproxy.cn", "goproxy.io", "mirrors.aliyun", "mirrors.tencent",
+    "mirrors.ustc", "mirrors.tuna", "npmmirror", "cnpm",
+    "douban", "huaweicloud",
+]
+
+CHINA_GIT_HOSTS = [
+    "gitee.com", "coding.net", "gitcode.net", "jihulab.com",
+    "codechina.csdn.net",
+]
+
+# Chinese-specific fonts that are NOT bundled in standard US macOS/Linux/Windows
+CHINA_FONTS_FINGERPRINT = [
+    "STHeiti", "STSong", "STFangsong", "STKaiti",
+    "SimSun", "SimHei", "FangSong", "KaiTi",
+    "Microsoft YaHei", "Microsoft JhengHei",
+    "WenQuanYi", "Noto Sans CJK SC", "Noto Serif CJK SC",
+    "Source Han Sans SC", "Source Han Serif SC",
+]
+
+# macOS-bundled CJK fonts (these come with every macOS regardless of language)
+MACOS_BUNDLED_CJK = {
+    "PingFang SC", "PingFang TC", "PingFang HK",
+    "STHeiti", "Heiti SC", "Heiti TC",
+    "Hiragino Sans GB", "Apple SD Gothic Neo",
+    "Apple LiGothic", "Apple LiSung",
+}
+
+
+def check_goproxy() -> dict[str, Any]:
+    """检查 Go 代理是否指向中国镜像。"""
+    r = run_shell("go env GOPROXY 2>/dev/null")
+    if r.returncode != 0:
+        return {"installed": False, "proxy": None, "china": False}
+    proxy = r.stdout.strip()
+    china = any(p in proxy.lower() for p in CHINA_MIRROR_PATTERNS)
+    return {"installed": True, "proxy": proxy, "china": china}
+
+
+def check_docker_mirrors() -> dict[str, Any]:
+    """检查 Docker daemon.json 是否配置了中国镜像。"""
+    result: dict[str, Any] = {"found": False, "mirrors": [], "china": False}
+    daemon_paths = []
+
+    if PLATFORM == "darwin":
+        daemon_paths.append(Path.home() / ".docker" / "daemon.json")
+    elif PLATFORM == "linux":
+        daemon_paths.extend([
+            Path("/etc/docker/daemon.json"),
+            Path.home() / ".docker" / "daemon.json",
+        ])
+    elif PLATFORM == "win32":
+        daemon_paths.append(Path.home() / ".docker" / "daemon.json")
+
+    for dp in daemon_paths:
+        if not dp.exists():
+            continue
+        try:
+            data = json.loads(dp.read_text(errors="ignore"))
+            mirrors = data.get("registry-mirrors", [])
+            if mirrors:
+                result["found"] = True
+                result["mirrors"] = mirrors
+                result["china"] = any(
+                    any(p in m.lower() for p in CHINA_MIRROR_PATTERNS)
+                    for m in mirrors
+                )
+                result["path"] = str(dp)
+                break
+        except Exception:
+            continue
+    return result
+
+
+def scan_git_remotes() -> list[str]:
+    """扫描常见项目目录中的 git remote，查找中国 Git 托管服务。"""
+    china_remotes: list[str] = []
+    home = Path.home()
+    search_dirs = [home]
+
+    # Also check common dev directories
+    for d in ["Projects", "Developer", "Code", "repos", "workspace", "src"]:
+        p = home / d
+        if p.is_dir():
+            search_dirs.append(p)
+
+    seen: set[str] = set()
+    for base in search_dirs:
+        try:
+            # Only scan 2 levels deep to avoid slowness
+            git_dirs = list(base.glob("*/.git")) + list(base.glob("*/*/.git"))
+        except (PermissionError, OSError):
+            continue
+        for git_dir in git_dirs:
+            repo = git_dir.parent
+            repo_str = str(repo)
+            if repo_str in seen:
+                continue
+            seen.add(repo_str)
+            r = run_shell(f'git -C "{repo}" remote -v 2>/dev/null')
+            if r.returncode != 0:
+                continue
+            for line in r.stdout.splitlines():
+                lower = line.lower()
+                for host in CHINA_GIT_HOSTS:
+                    if host in lower:
+                        china_remotes.append(f"{repo.name}: {line.split()[1]}")
+                        break
+    return china_remotes
+
+
+def check_vscode_locale() -> dict[str, Any]:
+    """检查 VS Code 的 locale 设置。"""
+    result: dict[str, Any] = {"found": False, "locale": None, "china": False}
+    settings_paths = []
+
+    if PLATFORM == "darwin":
+        settings_paths.append(
+            Path.home() / "Library/Application Support/Code/User/settings.json"
+        )
+    elif PLATFORM == "linux":
+        settings_paths.append(
+            Path.home() / ".config/Code/User/settings.json"
+        )
+    elif PLATFORM == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            settings_paths.append(Path(appdata) / "Code/User/settings.json")
+
+    # Also check locale.json (VS Code's language override)
+    for sp in list(settings_paths):
+        locale_json = sp.parent / "locale.json"
+        if locale_json not in settings_paths:
+            settings_paths.append(locale_json)
+
+    for sp in settings_paths:
+        if not sp.exists():
+            continue
+        try:
+            text = sp.read_text(errors="ignore")
+            # Handle JSONC (with comments)
+            text_clean = re.sub(r'//.*$', '', text, flags=re.MULTILINE)
+            data = json.loads(text_clean)
+            locale = data.get("locale") or data.get("vscode.locale")
+            if locale:
+                result["found"] = True
+                result["locale"] = locale
+                result["china"] = locale.lower().startswith("zh")
+                result["path"] = str(sp)
+                break
+        except Exception:
+            continue
+    return result
+
+
+def scan_ssh_known_hosts() -> list[str]:
+    """扫描 SSH known_hosts 中的中国 IP/域名。"""
+    hits: list[str] = []
+    kh = Path.home() / ".ssh" / "known_hosts"
+    if not kh.exists():
+        return hits
+
+    # China IP ranges (major blocks)
+    china_ip_prefixes = [
+        "1.0.", "1.1.", "1.2.", "1.4.", "1.8.",
+        "14.", "27.", "36.", "39.", "42.",
+        "49.", "58.", "59.", "60.", "61.",
+        "101.", "106.", "110.", "111.", "112.",
+        "113.", "114.", "115.", "116.", "117.",
+        "118.", "119.", "120.", "121.", "122.",
+        "123.", "124.", "125.", "139.", "140.",
+        "150.", "153.", "157.", "163.", "171.",
+        "175.", "180.", "182.", "183.", "202.",
+        "210.", "211.", "218.", "219.", "220.",
+        "221.", "222.", "223.",
+    ]
+    china_domains = [".cn", ".com.cn", "aliyun", "tencent", "huawei"]
+
+    try:
+        text = kh.read_text(errors="ignore")
+        for line in text.splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            host_part = line.split()[0] if line.split() else ""
+            lower_host = host_part.lower()
+
+            # Check domains
+            if any(d in lower_host for d in china_domains):
+                hits.append(host_part)
+                continue
+
+            # Check IP prefixes (only first host field)
+            for prefix in china_ip_prefixes:
+                if host_part.startswith(prefix) or host_part.startswith(f"[{prefix}"):
+                    hits.append(host_part)
+                    break
+    except Exception:
+        pass
+    return hits
+
+
+def check_system_fonts() -> dict[str, Any]:
+    """检查系统是否安装了暴露中文环境的字体。"""
+    result: dict[str, Any] = {"china_fonts": [], "total_cjk": 0}
+
+    if PLATFORM == "darwin":
+        r = run_shell("system_profiler SPFontsDataType 2>/dev/null | grep 'Full Name:'")
+        if r.returncode == 0:
+            fonts = [line.split(":", 1)[1].strip() for line in r.stdout.splitlines() if ":" in line]
+        else:
+            # Fallback: check font directories
+            fonts = []
+            for font_dir in [Path("/Library/Fonts"), Path.home() / "Library/Fonts"]:
+                if font_dir.exists():
+                    fonts.extend(f.stem for f in font_dir.iterdir() if f.suffix in (".ttf", ".otf", ".ttc"))
+
+    elif PLATFORM == "linux":
+        r = run_shell("fc-list :lang=zh family 2>/dev/null")
+        if r.returncode == 0:
+            fonts = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+        else:
+            fonts = []
+
+    elif PLATFORM == "win32":
+        fonts_dir = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts"
+        fonts = []
+        if fonts_dir.exists():
+            fonts = [f.stem for f in fonts_dir.iterdir() if f.suffix in (".ttf", ".otf", ".ttc")]
+    else:
+        fonts = []
+
+    for font_name in CHINA_FONTS_FINGERPRINT:
+        matches = [f for f in fonts if font_name.lower() in f.lower()]
+        if matches:
+            # On macOS, skip bundled CJK fonts
+            if PLATFORM == "darwin" and font_name in MACOS_BUNDLED_CJK:
+                continue
+            result["china_fonts"].append(font_name)
+
+    result["total_cjk"] = len(result["china_fonts"])
+    return result
+
