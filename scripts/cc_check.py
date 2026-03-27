@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone as dt_tz
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
@@ -29,6 +30,115 @@ from ip_quality import assess_ip_quality
 from scoring import compute_score, format_score_report
 import platform_ops as plat
 import vpn_adapter as vpnops
+
+
+# ---------------------------------------------------------------------------
+# ANSI Colors
+# ---------------------------------------------------------------------------
+
+def _supports_color() -> bool:
+    """检测终端是否支持 ANSI 颜色。"""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+class _C:
+    """ANSI 颜色常量。"""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    CYAN = "\033[36m"
+    MAGENTA = "\033[35m"
+    WHITE = "\033[97m"
+    BG_GREEN = "\033[42m"
+    BG_RED = "\033[41m"
+    BG_YELLOW = "\033[43m"
+
+
+USE_COLOR = _supports_color()
+
+
+def _c(color: str, text: str) -> str:
+    """Wrap text with ANSI color if terminal supports it."""
+    if not USE_COLOR:
+        return text
+    return f"{color}{text}{_C.RESET}"
+
+
+# ---------------------------------------------------------------------------
+# History tracking
+# ---------------------------------------------------------------------------
+
+HISTORY_FILE = Path.home() / ".cc-check" / "history.json"
+
+
+def save_history(score: int, grade: str, fail_count: int, warn_count: int) -> None:
+    """保存审计分数到历史文件。"""
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    history: list[dict] = []
+    if HISTORY_FILE.exists():
+        try:
+            history = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            history = []
+    history.append({
+        "timestamp": datetime.now(dt_tz.utc).isoformat(),
+        "score": score,
+        "grade": grade,
+        "fail": fail_count,
+        "warn": warn_count,
+    })
+    # 保留最近 100 条
+    history = history[-100:]
+    HISTORY_FILE.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def format_history() -> str:
+    """格式化历史分数趋势。"""
+    if not HISTORY_FILE.exists():
+        return "No history yet. Run 'inspect' to start tracking."
+    try:
+        history = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return "History file corrupted."
+    if not history:
+        return "No history yet."
+    lines = [_c(_C.BOLD, "\n📈 Score History (last 20):"), ""]
+    lines.append(f"  {'Date':<20} {'Score':>5}  {'Grade':>5}  {'Fail':>4}  {'Warn':>4}")
+    lines.append(f"  {'─'*20} {'─'*5}  {'─'*5}  {'─'*4}  {'─'*4}")
+    for entry in history[-20:]:
+        ts = entry.get("timestamp", "?")[:19].replace("T", " ")
+        score = entry.get("score", 0)
+        grade = entry.get("grade", "?")
+        fail = entry.get("fail", 0)
+        warn = entry.get("warn", 0)
+        # Color based on grade
+        if score >= 95:
+            score_str = _c(_C.GREEN + _C.BOLD, f"{score:>5}")
+        elif score >= 80:
+            score_str = _c(_C.GREEN, f"{score:>5}")
+        elif score >= 60:
+            score_str = _c(_C.YELLOW, f"{score:>5}")
+        else:
+            score_str = _c(_C.RED, f"{score:>5}")
+        lines.append(f"  {ts:<20} {score_str}  {grade:>5}  {fail:>4}  {warn:>4}")
+    # Trend
+    if len(history) >= 2:
+        delta = history[-1]["score"] - history[-2]["score"]
+        if delta > 0:
+            lines.append(_c(_C.GREEN, f"\n  ↑ +{delta} since last run"))
+        elif delta < 0:
+            lines.append(_c(_C.RED, f"\n  ↓ {delta} since last run"))
+        else:
+            lines.append(_c(_C.DIM, "\n  → No change since last run"))
+    lines.append("")
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -788,20 +898,26 @@ def fix_vpn(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
 # Report & CLI
 # ---------------------------------------------------------------------------
 
-def print_report(findings: list[Finding], show_score: bool = True) -> None:
+def print_report(findings: list[Finding], show_score: bool = True, save: bool = True) -> None:
     grouped: dict[str, list[Finding]] = {}
     for f in findings:
         grouped.setdefault(f.group, []).append(f)
 
-    status_icon = {"pass": "✅", "fail": "❌", "warn": "⚠️ ", "skip": "⏭️ "}
+    status_icon = {
+        "pass": _c(_C.GREEN, "✅"),
+        "fail": _c(_C.RED, "❌"),
+        "warn": _c(_C.YELLOW, "⚠️ "),
+        "skip": _c(_C.DIM, "⏭️ "),
+    }
 
     for group in sorted(grouped):
-        print(f"\n[{group}]")
+        print(_c(_C.BOLD + _C.CYAN, f"\n[{group}]"))
         for f in grouped[group]:
             icon = status_icon.get(f.status, "?")
-            print(f"  {icon} {f.key}: {f.summary}")
+            key_str = _c(_C.WHITE, f.key) if USE_COLOR else f.key
+            print(f"  {icon} {key_str}: {f.summary}")
             for d in f.details:
-                print(f"      · {d}")
+                print(_c(_C.DIM, f"      · {d}"))
 
     if show_score:
         report = compute_score(findings)
@@ -810,7 +926,18 @@ def print_report(findings: list[Finding], show_score: bool = True) -> None:
     fail_count = sum(1 for f in findings if f.status == "fail")
     warn_count = sum(1 for f in findings if f.status == "warn")
     pass_count = sum(1 for f in findings if f.status == "pass")
-    print(f"Summary: {pass_count} pass, {warn_count} warn, {fail_count} fail")
+
+    summary_parts = [
+        _c(_C.GREEN, f"{pass_count} pass"),
+        _c(_C.YELLOW, f"{warn_count} warn"),
+        _c(_C.RED, f"{fail_count} fail") if fail_count else f"{fail_count} fail",
+    ]
+    print(f"Summary: {', '.join(summary_parts)}")
+
+    # Save to history
+    if show_score and save:
+        report = compute_score(findings)
+        save_history(report.total_score, report.grade, fail_count, warn_count)
 
 
 def main() -> int:
@@ -830,6 +957,8 @@ def main() -> int:
         sp.add_argument("--json", action="store_true", help="Output as JSON")
         sp.add_argument("--dry-run", action="store_true", help="Preview changes without applying")
 
+    history_sp = sub.add_parser("history", help="Show score history and trends")
+
     dns_sp = sub.add_parser("fix-system-dns-display")
     dns_sp.add_argument("--quiet", action="store_true")
     dns_sp.add_argument("--dry-run", action="store_true")
@@ -838,6 +967,10 @@ def main() -> int:
     ctx = make_context(args)
 
     try:
+        if args.command == "history":
+            print(format_history())
+            return 0
+
         if args.command == "inspect":
             findings = collect_findings(ctx)
             if getattr(args, "json", False):
@@ -849,6 +982,11 @@ def main() -> int:
         if args.command == "fix-local":
             for a in fix_local(ctx):
                 print(a)
+            if not ctx.dry_run:
+                print(_c(_C.BOLD, "\n=== Auto-Verify ==="))
+                verify_findings = collect_findings(ctx, include_vpn=False)
+                print_report(verify_findings)
+                return 0 if not any(f.status == "fail" for f in verify_findings) else 2
             return 0
 
         if args.command == "fix-vpn":

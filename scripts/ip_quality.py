@@ -67,27 +67,52 @@ def parse_whois_country(text: str) -> str | None:
 
 
 def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[str, Any]:
-    """用多权威渠道评估 IP 质量。"""
-    # 1. ipinfo.io
-    ipinfo = fetch_json(f"https://ipinfo.io/{ip}/json")
+    """用多权威渠道评估 IP 质量（并行加速）。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # 2. ip-api.com
-    ip_api = fetch_json(
-        f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,"
-        f"timezone,isp,org,as,asname,proxy,hosting,mobile,query"
-    )
+    # 并行请求 5 个渠道
+    def _fetch_ipinfo() -> dict | None:
+        return fetch_json(f"https://ipinfo.io/{ip}/json")
 
-    # 3. proxycheck.io
-    proxycheck = fetch_json(
-        f"https://proxycheck.io/v2/{ip}?vpn=1&asn=1&risk=1&port=1&seen=1&days=7&tag=cc-check"
-    )
+    def _fetch_ip_api() -> dict | None:
+        return fetch_json(
+            f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,"
+            f"timezone,isp,org,as,asname,proxy,hosting,mobile,query"
+        )
 
-    # 4. bgpview.io
-    bgpview = fetch_json(f"https://api.bgpview.io/ip/{ip}")
+    def _fetch_proxycheck() -> dict | None:
+        return fetch_json(
+            f"https://proxycheck.io/v2/{ip}?vpn=1&asn=1&risk=1&port=1&seen=1&days=7&tag=cc-check"
+        )
 
-    # 5. whois
-    whois_text = run_whois(ip)
-    whois_country = parse_whois_country(whois_text)
+    def _fetch_bgpview() -> dict | None:
+        return fetch_json(f"https://api.bgpview.io/ip/{ip}")
+
+    def _fetch_whois() -> str:
+        return run_whois(ip)
+
+    results: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_fetch_ipinfo): "ipinfo",
+            pool.submit(_fetch_ip_api): "ip_api",
+            pool.submit(_fetch_proxycheck): "proxycheck",
+            pool.submit(_fetch_bgpview): "bgpview",
+            pool.submit(_fetch_whois): "whois",
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception:
+                results[name] = None
+
+    ipinfo = results.get("ipinfo")
+    ip_api = results.get("ip_api")
+    proxycheck = results.get("proxycheck")
+    bgpview = results.get("bgpview")
+    whois_text = results.get("whois", "")
+    whois_country = parse_whois_country(whois_text) if whois_text else None
 
     proxy_data = None
     if proxycheck and proxycheck.get("status") == "ok":
