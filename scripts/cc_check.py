@@ -922,22 +922,27 @@ def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
             else:
                 actions.append("Skipped Clash Verge DNS toggle to avoid breaking domain-based proxies")
 
-    # DNS display
-    if has_failure(findings, {"system-dns-display"}):
+    # DNS display — fix on both fail and warn (TUN cosmetic)
+    dns_needs_fix = any(
+        f.key == "system-dns-display" and f.status in ("fail", "warn")
+        for f in findings
+    )
+    if dns_needs_fix:
         dns_map = plat.get_dns_servers()
         for svc, servers in dns_map.items():
             if any(s in plat.SUSPICIOUS_DNS for s in servers):
                 if ctx.dry_run:
-                    actions.append(f"[DRY RUN] Would clear suspicious DNS for {svc}")
+                    actions.append(f"[DRY RUN] Would set safe DNS for {svc}")
                 else:
                     plat.clear_dns_for_service(svc)
-                    actions.append(f"Cleared DNS for {svc}")
+                    actions.append(f"Set safe DNS for {svc}")
 
-    # DNS watchdog
-    if plat.PLATFORM == "darwin" and ctx.clash_dir and (
-        has_failure(findings, {"system-dns-display"}) or
+    # DNS watchdog — install on fail, warn, or missing
+    watchdog_needed = plat.PLATFORM == "darwin" and ctx.clash_dir and (
+        dns_needs_fix or
         any(f.key == "dns-cleanup-watchdog" and f.status != "pass" for f in findings)
-    ):
+    )
+    if watchdog_needed:
         if ctx.dry_run:
             actions.append("[DRY RUN] Would install DNS cleanup watchdog")
         else:
