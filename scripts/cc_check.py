@@ -227,13 +227,20 @@ def fetch_text_url(url: str, timeout: int = 12, retries: int = 2) -> str | None:
     return None
 
 
-def classify_google_dns(lines: list[str]) -> tuple[str, str]:
+def classify_google_dns(lines: list[str], clash_running: bool = False) -> tuple[str, str]:
+    """分类 Google DNS whoami 结果。
+
+    当 Clash 在运行时，Cloudflare 边缘 IP 是预期行为（DNS 走加密 DoH 通道），
+    应判定为 pass 而不是 warn。
+    """
     text = " | ".join(lines)
     if not text:
         return "warn", "Google DNS whoami returned empty output"
     if any(m in text for m in FAIL_GOOGLE_MARKERS):
         return "fail", f"Google DNS whoami shows China ISP: {text}"
     if any(m in text for m in LOW_RISK_GOOGLE_MARKERS) or "edns0-client-subnet" in text:
+        if clash_running:
+            return "pass", f"Google DNS via Clash DoH (expected): {text}"
         return "warn", f"Google DNS PoP acceptable but not ideal: {text}"
     return "pass", f"Google DNS whoami clean: {text}"
 
@@ -337,7 +344,7 @@ def inspect_dns(public_ip: str | None) -> list[Finding]:
     # Google DNS whoami
     r = plat.run_shell("dig +time=3 +tries=1 +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null")
     lines = [l.strip().strip('"') for l in r.stdout.splitlines() if l.strip()]
-    status, summary = classify_google_dns(lines)
+    status, summary = classify_google_dns(lines, clash_running=plat.is_clash_running())
     findings.append(Finding("dns", "dns-google", status, summary))
 
     # Cloudflare DNS whoami
