@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ PLATFORM = sys.platform  # darwin / linux / win32
 
 def _detect_shell() -> str:
     if PLATFORM == "win32":
-        return "powershell"
+        return _detect_windows_shell()
     shell = os.environ.get("SHELL", "")
     if "zsh" in shell:
         return "/bin/zsh"
@@ -35,18 +36,67 @@ def _detect_shell() -> str:
     return "/bin/bash"
 
 
+def _detect_windows_shell() -> str:
+    """优先使用 pwsh，不存在时再退回 powershell。"""
+    for shell_name in ("pwsh", "powershell"):
+        shell_path = shutil.which(shell_name)
+        if shell_path:
+            return shell_path
+    return "powershell"
+
+
+def _prepare_command_args(args: list[str]) -> list[str]:
+    """在 Windows 下兼容 .cmd/.bat 包装器。"""
+    if PLATFORM != "win32" or not args:
+        return args
+
+    resolved = shutil.which(args[0]) or args[0]
+    prepared = [resolved, *args[1:]]
+    if str(resolved).lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("ComSpec", "cmd.exe")
+        return [comspec, "/d", "/s", "/c", subprocess.list2cmdline(prepared)]
+    return prepared
+
+
+def run_command(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    """直接调用外部程序，避免 shell 引号和重定向差异。"""
+    prepared_args = _prepare_command_args(args)
+    try:
+        return subprocess.run(
+            prepared_args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(prepared_args, 127, "", f"Command not found: {args[0]}")
+
+
 def run_shell(command: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     """执行当前平台的 shell 命令。"""
     if PLATFORM == "win32":
         return subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
-            capture_output=True, text=True, timeout=timeout, check=False,
+            [_detect_windows_shell(), "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
         )
     shell = _detect_shell()
     flag = "-lc" if "zsh" in shell else "-c"
     return subprocess.run(
         [shell, flag, command],
-        capture_output=True, text=True, timeout=timeout, check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
     )
 
 
@@ -432,13 +482,106 @@ CHINA_MIRROR_KEYWORDS = [
 ]
 
 
+def _first_successful_stdout(commands: list[list[str]], timeout: int = 30) -> str:
+    """依次尝试多个命令，返回第一个有效输出。"""
+    for args in commands:
+        result = run_command(args, timeout=timeout)
+        output = result.stdout.strip()
+        if result.returncode == 0 and output and output.lower() not in {"null", "undefined"}:
+            return output
+    return ""
+
+
+def get_npm_registry() -> str:
+    """读取 npm registry。"""
+    return _first_successful_stdout([["npm", "config", "get", "registry"]])
+
+
+def set_npm_registry(registry: str) -> bool:
+    """设置 npm registry。"""
+    result = run_command(["npm", "config", "set", "registry", registry])
+    return result.returncode == 0
+
+
+def get_pip_index_url() -> str:
+    """读取 pip 全局 index-url。"""
+    return _first_successful_stdout(
+        [
+            ["pip3", "config", "get", "global.index-url"],
+            [sys.executable, "-m", "pip", "config", "get", "global.index-url"],
+        ]
+    )
+
+
+def unset_pip_global_index() -> bool:
+    """移除 pip 全局 index-url。"""
+    for args in (
+        ["pip3", "config", "unset", "global.index-url"],
+        [sys.executable, "-m", "pip", "config", "unset", "global.index-url"],
+    ):
+        result = run_command(args)
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def get_git_global_value(key: str) -> str:
+    """读取 git 全局配置项。"""
+    result = run_command(["git", "config", "--global", key])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def unset_git_global_value(key: str) -> bool:
+    """移除 git 全局配置项。"""
+    result = run_command(["git", "config", "--global", "--unset", key])
+    return result.returncode == 0
+
+
+def remove_tree(path: Path) -> bool:
+    """递归删除目录。"""
+    if not path.exists():
+        return True
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return not path.exists()
+
+
+def find_china_mirror_residue() -> list[str]:
+    """用 Python 直接扫描 npm 相关残留文件。"""
+    candidates: list[Path] = []
+    npm_root = Path.home() / ".npm"
+    if npm_root.exists():
+        for pattern in ("*.json", "*.npmrc", "*npmrc*"):
+            candidates.extend(npm_root.rglob(pattern))
+    npmrc = Path.home() / ".npmrc"
+    if npmrc.exists():
+        candidates.append(npmrc)
+
+    hits: list[str] = []
+    seen: set[Path] = set()
+    for path in sorted(candidates):
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            text = path.read_text(errors="ignore").lower()
+        except OSError:
+            continue
+        if any(keyword in text for keyword in CHINA_MIRROR_KEYWORDS):
+            hits.append(str(path))
+    return hits
+
+
 def check_package_mirrors() -> dict[str, dict[str, Any]]:
     """检测 npm/pip/brew 是否使用了中国镜像。"""
     results: dict[str, dict[str, Any]] = {}
 
     # npm
-    r = run_shell("npm config get registry 2>/dev/null")
-    npm_reg = r.stdout.strip() if r.returncode == 0 else ""
+    npm_reg = get_npm_registry()
     is_china = any(kw in npm_reg.lower() for kw in CHINA_MIRROR_KEYWORDS)
     results["npm"] = {"registry": npm_reg, "is_china_mirror": is_china}
 
@@ -451,9 +594,9 @@ def check_package_mirrors() -> dict[str, dict[str, Any]]:
             if m:
                 pip_index = m.group(1)
                 break
-    r = run_shell("pip3 config get global.index-url 2>/dev/null")
-    if r.returncode == 0 and r.stdout.strip():
-        pip_index = pip_index or r.stdout.strip()
+    pip_output = get_pip_index_url()
+    if pip_output:
+        pip_index = pip_index or pip_output
     is_china = any(kw in pip_index.lower() for kw in CHINA_MIRROR_KEYWORDS) if pip_index else False
     results["pip"] = {"index": pip_index or "(default pypi)", "is_china_mirror": is_china}
 
@@ -485,7 +628,7 @@ def get_nodejs_env() -> dict[str, str]:
         platform: os.platform(),
     }));
     """
-    r = run_shell(f'node -e \'{script.strip()}\' 2>/dev/null')
+    r = run_command(["node", "-e", script.strip()])
     if r.returncode != 0:
         return {}
     try:

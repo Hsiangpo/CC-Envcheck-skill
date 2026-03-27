@@ -2,14 +2,16 @@
 # -*- coding: utf-8 -*-
 """CC-check 单元测试 — scoring, ip_quality, platform_ops 核心逻辑。
 
-运行: python3 -m pytest tests/ -v
-或:   python3 -m unittest tests/test_cc_check.py -v
+运行: python -m pytest tests/ -v
+或:   python -m unittest discover -s tests -p test_cc_check.py -v
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +25,7 @@ from ip_quality import (
     GOOD_IP_TYPES, BAD_IP_TYPES, US_RESIDENTIAL_ISPS,
     IANA_TIMEZONE_TO_LOCALE, parse_whois_country,
 )
+import cc_check
 import platform_ops as plat
 
 
@@ -336,6 +339,111 @@ class TestBuildLinuxScript(unittest.TestCase):
         self.assertIn("114.114.114.114", script)
         self.assertIn("resolvectl", script)
         self.assertIn("#!/bin/bash", script)
+
+
+class TestWindowsCommandCompatibility(unittest.TestCase):
+    """验证 Windows 下的外部命令执行兼容性。"""
+
+    @patch.object(plat, "PLATFORM", "win32")
+    @patch("platform_ops.subprocess.run")
+    def test_get_nodejs_env_uses_native_process_invocation(self, mock_run):
+        """Windows 应直接调用 node，而不是包一层 PowerShell 字符串。"""
+
+        def side_effect(args, **kwargs):
+            joined = " ".join(str(part) for part in args).lower()
+            if "node" in joined and "powershell" not in joined and "pwsh" not in joined:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    '{"tz":"America/Los_Angeles","locale":"en-US","time":"ok","hostname":"pc","platform":"win32"}\n',
+                    "",
+                )
+            return subprocess.CompletedProcess(args, 1, "", "unexpected wrapper")
+
+        mock_run.side_effect = side_effect
+
+        info = plat.get_nodejs_env()
+
+        self.assertEqual(info["tz"], "America/Los_Angeles")
+        self.assertEqual(info["locale"], "en-US")
+
+    @patch.object(plat, "PLATFORM", "win32")
+    @patch("platform_ops.subprocess.run")
+    def test_check_package_mirrors_reads_real_windows_command_output(self, mock_run):
+        """Windows 下 npm/pip 检测应该读到真实命令输出。"""
+
+        def side_effect(args, **kwargs):
+            joined = " ".join(str(part) for part in args).lower()
+            if "npm" in joined and "powershell" not in joined and "pwsh" not in joined:
+                return subprocess.CompletedProcess(args, 0, "https://registry.npmmirror.com/\n", "")
+            if any(name in joined for name in ("pip3", "python", "python3")) and "powershell" not in joined and "pwsh" not in joined:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    "https://pypi.tuna.tsinghua.edu.cn/simple\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(args, 1, "", "unexpected wrapper")
+
+        mock_run.side_effect = side_effect
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch("platform_ops.Path.home", return_value=Path(tmpdir)):
+            result = plat.check_package_mirrors()
+
+        self.assertEqual(result["npm"]["registry"], "https://registry.npmmirror.com/")
+        self.assertTrue(result["npm"]["is_china_mirror"])
+        self.assertEqual(result["pip"]["index"], "https://pypi.tuna.tsinghua.edu.cn/simple")
+        self.assertTrue(result["pip"]["is_china_mirror"])
+
+    def test_find_china_mirror_residue_scans_files_without_shell_tools(self):
+        """镜像残留扫描应由 Python 直接完成，而不是依赖 find/grep。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch("platform_ops.Path.home", return_value=Path(tmpdir)):
+            npm_dir = Path(tmpdir) / ".npm" / "cache"
+            npm_dir.mkdir(parents=True)
+            (npm_dir / "cache.json").write_text('{"registry":"https://registry.npmmirror.com/"}', encoding="utf-8")
+            (Path(tmpdir) / ".npmrc").write_text("registry=https://registry.npmjs.org/\n", encoding="utf-8")
+
+            result = plat.find_china_mirror_residue()
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0].endswith("cache.json"))
+
+
+class TestFixLocalWindowsSafety(unittest.TestCase):
+    """验证 Windows 下 fix-local 的关键动作能真正生效。"""
+
+    def test_fix_local_removes_telemetry_directory_without_rm(self):
+        """删除 telemetry 不应依赖 rm -rf 这类 Unix 命令。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            claude_dir = root / ".claude"
+            telemetry = claude_dir / "telemetry"
+            telemetry.mkdir(parents=True)
+            (telemetry / "event.json").write_text("{}", encoding="utf-8")
+
+            ctx = cc_check.Context(
+                skill_root=root,
+                home=root,
+                claude_dir=claude_dir,
+                clash_dir=None,
+                vpn_root=None,
+                public_subscription_url=None,
+                target_timezone=None,
+                target_locale=None,
+                target_language=None,
+                proxy_url=None,
+                expected_ip_type="residential",
+                dry_run=False,
+            )
+            findings = [cc_check.Finding("privacy", "telemetry", "fail", "Claude telemetry exists")]
+
+            with patch("cc_check.fetch_public_ip", return_value=None), patch("cc_check.build_target_profile", return_value={}):
+                actions = cc_check.fix_local(ctx, findings=findings)
+
+            self.assertFalse(telemetry.exists())
+            self.assertIn("Removed Claude telemetry", actions)
 
 
 if __name__ == "__main__":

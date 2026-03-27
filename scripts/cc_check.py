@@ -404,8 +404,7 @@ def inspect_packages() -> list[Finding]:
         findings.append(Finding("packages", "brew-mirrors", "pass", "brew mirrors: default"))
 
     # cnpm/taobao residue in ~/.npm
-    r = plat.run_shell('find ~/.npm ~/.npmrc -name "*.json" -exec grep -l "taobao\\|npmmirror\\|cnpm\\|tencent" {} \\; 2>/dev/null')
-    residue_files = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    residue_files = plat.find_china_mirror_residue()
     if residue_files:
         findings.append(Finding("packages", "china-mirror-residue", "fail",
                                 f"{len(residue_files)} files with China mirror refs", residue_files[:3]))
@@ -457,8 +456,8 @@ def inspect_privacy(ctx: Context) -> list[Finding]:
 
 def inspect_identity() -> list[Finding]:
     findings: list[Finding] = []
-    name = plat.run_shell("git config --global user.name 2>/dev/null").stdout.strip()
-    email = plat.run_shell("git config --global user.email 2>/dev/null").stdout.strip()
+    name = plat.get_git_global_value("user.name")
+    email = plat.get_git_global_value("user.email")
     if name or email:
         findings.append(Finding("identity", "git-identity", "fail",
                                 f"Global git identity set: {name} <{email}>"))
@@ -659,16 +658,18 @@ def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
                 count = sum(1 for _ in tel.iterdir())
                 actions.append(f"[DRY RUN] Would remove {tel} ({count} files)")
             else:
-                plat.run_shell(f'rm -rf "{tel}"')
-                actions.append("Removed Claude telemetry")
+                if plat.remove_tree(tel):
+                    actions.append("Removed Claude telemetry")
+                else:
+                    actions.append("Failed to remove Claude telemetry")
 
     # Git
     if has_failure(findings, {"git-identity"}):
         if ctx.dry_run:
             actions.append("[DRY RUN] Would unset git user.name and user.email")
         else:
-            plat.run_shell("git config --global --unset user.name 2>/dev/null")
-            plat.run_shell("git config --global --unset user.email 2>/dev/null")
+            plat.unset_git_global_value("user.name")
+            plat.unset_git_global_value("user.email")
             actions.append("Cleared global git identity")
 
     # Clash Verge DNS toggle
@@ -705,7 +706,7 @@ def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
         if ctx.dry_run:
             actions.append("[DRY RUN] Would reset npm registry to https://registry.npmjs.org/")
         else:
-            plat.run_shell("npm config set registry https://registry.npmjs.org/")
+            plat.set_npm_registry("https://registry.npmjs.org/")
             actions.append("Reset npm registry to https://registry.npmjs.org/")
 
     # Package mirrors: pip
@@ -713,7 +714,7 @@ def fix_local(ctx: Context, findings: list[Finding] | None = None) -> list[str]:
         if ctx.dry_run:
             actions.append("[DRY RUN] Would remove China pip index-url from config")
         else:
-            plat.run_shell("pip3 config unset global.index-url 2>/dev/null || true")
+            plat.unset_pip_global_index()
             for pip_conf in [ctx.home / ".pip" / "pip.conf", ctx.home / ".config" / "pip" / "pip.conf"]:
                 if pip_conf.exists():
                     text = pip_conf.read_text(errors="ignore")
