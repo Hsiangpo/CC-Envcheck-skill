@@ -72,12 +72,12 @@ The skill currently groups checks into:
 
 - `network`: public IP, multi-source IP, IPv6 leakage
 - `ip-quality`: residential / proxy / hosting confidence
-- `dns`: actual DNS path and displayed DNS state
-- `system`: timezone, locale, proxy env, input method, hostname and related machine signals
+- `dns`: actual DNS path, displayed DNS state (TUN-aware: cosmetic DNS downgraded to warn when TUN active)
+- `system`: timezone, locale, proxy env, input method, hostname, VS Code locale, font fingerprints
 - `nodejs`: Node runtime timezone and locale when Node is available
-- `packages`: npm / pip / brew mirror checks
-- `privacy`: telemetry residue and privacy env
-- `identity`: git identity
+- `packages`: npm / pip / brew mirror checks, GOPROXY, Docker daemon.json mirrors
+- `privacy`: telemetry residue, privacy env, SSH known_hosts China IP scan, shell history
+- `identity`: git identity, git remote China-host scan
 - `clash`: process, mode, TUN, runtime markers, DNS watchdog
 - `claude`: Claude settings
 - `vpn`: supported VPN project and remote deployment checks when a compatible project is detected
@@ -103,15 +103,19 @@ Each check has a weight. The total is aggregated into a percentage and letter gr
 - Shell profile files (`~/.zprofile`, `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, or PowerShell `$PROFILE`)
 - `~/.claude/` telemetry data
 - Global git config (`user.name`, `user.email`)
-- System DNS display values for services with suspicious Chinese DNS
-- DNS cleanup watchdog (macOS LaunchAgent)
+- System DNS: cross-platform DHCP-resistant static DNS (`set_static_dns()`)
+  - macOS: `networksetup` + `scutil` StaticDNS override (DHCP cannot override)
+  - Linux: `nmcli` with `ignore-auto-dns=yes` or `resolved.conf` fallback
+  - Windows: `netsh` static DNS mode
+- DNS cleanup watchdog (macOS LaunchAgent / Linux systemd timer, 15s auto-correction)
+- npm / pip / brew registry reset
 
 ### `fix-vpn` may safely mutate:
 - Generated files in the detected VPN project root
 - Public subscription state via detected deploy script
 - Remote VPN service state on configured host
 
-Both fix commands only touch items that inspection marked as `fail`.
+Both fix commands touch items marked as `fail` or `warn` (DNS is fixed on warn too, since TUN-mode DNS is cosmetic but still worth cleaning).
 
 ## Low-Risk Findings (reported as `warn`, not auto-fixed)
 
@@ -131,9 +135,9 @@ Both fix commands only touch items that inspection marked as `fail`.
 
 ## Cross-Platform Notes
 
-- **macOS**: fullest inspection and repair support
-- **Linux**: inspection support is broader than repair support
-- **Windows**: inspection support exists for selected checks, repair support is limited
+- **macOS**: fullest inspection and repair support (3-layer DNS protection)
+- **Linux**: full inspection + nmcli/resolved DNS fix + systemd watchdog
+- **Windows**: full inspection + netsh static DNS fix
 
 Do not promise full parity across platforms unless the implementation actually has it.
 
@@ -141,10 +145,12 @@ Do not promise full parity across platforms unless the implementation actually h
 
 ```
 scripts/
-├── cc_check.py        # Main orchestrator & CLI
+├── cc_check.py        # Main orchestrator & CLI (~1100 lines)
 ├── ip_quality.py      # Multi-channel IP quality assessment
-├── platform_ops.py    # Cross-platform abstraction layer
-└── scoring.py         # 100-point scoring system
+├── platform_ops.py    # Cross-platform abstraction layer (~1500 lines)
+├── scoring.py         # 100-point scoring system
+├── vpn_adapter.py     # VPN project adapter
+└── browser_leaks.py   # Browser leak detection
 ```
 
 ## References
