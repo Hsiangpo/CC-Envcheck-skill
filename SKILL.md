@@ -137,7 +137,7 @@ Both fix commands touch items marked as `fail` or `warn` (DNS is fixed on warn t
 
 - **macOS**: fullest inspection and repair support (3-layer DNS protection)
 - **Linux**: full inspection + nmcli/resolved DNS fix + systemd watchdog
-- **Windows**: full inspection + netsh static DNS fix
+- **Windows**: full inspection + netsh static DNS fix + Task Scheduler watchdog
 
 Do not promise full parity across platforms unless the implementation actually has it.
 

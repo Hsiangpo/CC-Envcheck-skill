@@ -84,7 +84,7 @@ CC-Check 是一个面向 **Claude Code** 的终端环境审计工具。它通过
 |------|-------|-------|---------|
 | 全维度检测 | ✅ 完整 | ✅ 完整 | ✅ 核心项完整 |
 | DNS 根治（DHCP 防覆盖） | ✅ `networksetup` + `scutil` | ✅ `nmcli` + `ignore-auto-dns` | ✅ `netsh static` |
-| DNS 自动守护 | ✅ LaunchAgent 15s | ✅ systemd timer 15s | ❌ |
+| DNS 自动守护 | ✅ LaunchAgent 15s | ✅ systemd timer 15s | ✅ Task Scheduler 60s |
 | Shell 环境修复 | ✅ zsh/bash/fish | ✅ bash/zsh/fish | ✅ PowerShell |
 | 包管理器修复 | ✅ npm/pip/brew | ✅ npm/pip/brew | ✅ npm/pip |
 

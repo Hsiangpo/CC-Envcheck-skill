@@ -1184,7 +1184,29 @@ def install_dns_watchdog(clash_dir: Path) -> list[str]:
         actions.append("Installed Linux DNS cleanup systemd user timer")
 
     elif PLATFORM == "win32":
-        actions.append("Windows DNS watchdog: not implemented (DNS usually managed by proxy client)")
+        # Windows: Task Scheduler with PowerShell cleanup script
+        scripts_dir = clash_dir if clash_dir.exists() else Path.home() / ".cc-check"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+
+        ps_script = scripts_dir / "cleanup_system_dns.ps1"
+        ps_script.write_text(_build_windows_cleanup_script(), encoding="utf-8")
+
+        task_name = "CC-Check-DNS-Cleanup"
+        # Remove existing task if any
+        run_shell(f'schtasks /Delete /TN "{task_name}" /F 2>$null; exit 0')
+        # Create scheduled task: run every 1 minute, at logon
+        run_shell(
+            f'schtasks /Create /TN "{task_name}" '
+            f'/TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\"{ps_script}\\"" '
+            f'/SC MINUTE /MO 1 /F'
+        )
+        # Also run at logon
+        run_shell(
+            f'schtasks /Create /TN "{task_name}-Logon" '
+            f'/TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \\"{ps_script}\\"" '
+            f'/SC ONLOGON /F'
+        )
+        actions.append("Installed Windows DNS cleanup Task Scheduler job (every 60s)")
     return actions
 
 
@@ -1225,6 +1247,35 @@ cleanup_resolv() {{
 }}
 
 cleanup_resolv
+"""
+
+
+def _build_windows_cleanup_script() -> str:
+    """生成 Windows PowerShell DNS 清理脚本。"""
+    suspicious_csv = ", ".join(f'"{d}"' for d in SUSPICIOUS_DNS)
+    safe_csv = ", ".join(f'"{d}"' for d in SAFE_DNS_SERVERS)
+    return f"""# CC-check DNS cleanup for Windows
+# Runs via Task Scheduler every 60 seconds
+# Checks all active network adapters for suspicious China DNS servers
+
+$suspicious = @({suspicious_csv})
+$safeDns = @({safe_csv})
+
+$adapters = Get-NetAdapter | Where-Object {{ $_.Status -eq 'Up' }}
+foreach ($adapter in $adapters) {{
+    $dnsServers = (Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4).ServerAddresses
+    $hasSuspicious = $false
+    foreach ($dns in $dnsServers) {{
+        if ($suspicious -contains $dns) {{
+            $hasSuspicious = $true
+            break
+        }}
+    }}
+    if ($hasSuspicious) {{
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -ServerAddresses $safeDns
+        Write-Output "Fixed DNS on $($adapter.Name): $($safeDns -join ', ')"
+    }}
+}}
 """
 
 
