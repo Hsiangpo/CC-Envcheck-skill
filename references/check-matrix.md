@@ -1,6 +1,6 @@
 # CC-Check Audit Matrix v3
 
-> 11 groups, 40+ checks, 100-point scale (exact), 36 unit tests
+> 11 groups, 50+ checks, 100-point scale (exact), 44 unit tests
 
 ## 1. IP Quality (weight: 30/100) 🔴 最高优先级
 
@@ -34,6 +34,8 @@ Pseudo-residential (伪住宅) detection:
 | input-method | No Chinese IME active | 1 | `HIToolbox.plist` / `gsettings` |
 | hosts-file | No suspicious /etc/hosts entries | 1 | File scan |
 | user-identity | Username/RealName info | 1 | `id` / `getent` / Windows identity |
+| vscode-locale | VS Code not set to Chinese | 0 | `settings.json` locale field |
+| font-fingerprint | No non-bundled Chinese fonts | 0 | `system_profiler` / `fc-list` / Registry |
 
 ## 3. DNS (weight: 15/100)
 
@@ -42,6 +44,8 @@ Pseudo-residential (伪住宅) detection:
 | dns-google | Google DNS whoami | 7 | `dig TXT o-o.myaddr.l.google.com @ns1.google.com` |
 | dns-cloudflare | Cloudflare DNS whoami | 4 | `dig CH TXT whoami.cloudflare @1.1.1.1` |
 | system-dns-display | System DNS not China ISP | 4 | `networksetup`/`resolvectl`/PowerShell per platform |
+
+TUN-aware: When Clash TUN is active with dns-hijack, system DNS is cosmetic (downgraded to `warn` instead of `fail`).
 
 Suspicious DNS:
 - 114.114.114.114 (China 114DNS)
@@ -64,7 +68,7 @@ Suspicious DNS:
 | mode | Not in direct mode | 1 | Clash API `/configs` |
 | tun-enabled | TUN interface exists | 2 | `ifconfig`/`ip link`/`Get-NetAdapter` + config |
 | runtime-markers | Hardened DNS markers in config | 2 | Config file content scan |
-| dns-cleanup-watchdog | Watchdog installed (macOS) | 1 | File existence check |
+| dns-cleanup-watchdog | Watchdog installed | 1 | macOS LaunchAgent / Linux systemd / Windows Task Scheduler |
 
 ## 6. Packages (weight: 6/100)
 
@@ -74,8 +78,10 @@ Suspicious DNS:
 | pip-index | pip not China mirror | 1 | `pip3 config` + config file scan |
 | brew-mirrors | Homebrew vars default | 1 | `HOMEBREW_*` environment variables |
 | china-mirror-residue | No taobao/npmmirror refs in npm cache | 2 | `find ~/.npm -exec grep ...` |
+| goproxy | GOPROXY not China mirror | 0 | `go env GOPROXY` |
+| docker-mirror | Docker daemon.json no China mirror | 0 | `/etc/docker/daemon.json` scan |
 
-China mirror keywords: taobao, npmmirror, cnpm, tencent, aliyun, tuna.tsinghua, ustc.edu.cn, huaweicloud, 163.com, douban, bfsu.edu.cn
+China mirror keywords: taobao, npmmirror, cnpm, tencent, aliyun, tuna.tsinghua, ustc.edu.cn, huaweicloud, 163.com, douban, bfsu.edu.cn, goproxy.cn, goproxy.io
 
 ## 7. Privacy (weight: 6/100)
 
@@ -85,6 +91,7 @@ China mirror keywords: taobao, npmmirror, cnpm, tencent, aliyun, tuna.tsinghua, 
 | privacy-env | DISABLE_TELEMETRY et al. set | 2 | Environment variables |
 | session-residue | Claude sessions clean | 1 | `~/.claude/sessions/` |
 | shell-history | No China domain refs in history | 1 | `.zsh_history` / `.bash_history` scan |
+| ssh-known-hosts | No China IPs/domains in known_hosts | 0 | `~/.ssh/known_hosts` scan |
 
 ## 8. Node.js (weight: 2/100)
 
@@ -98,6 +105,7 @@ China mirror keywords: taobao, npmmirror, cnpm, tencent, aliyun, tuna.tsinghua, 
 | Key | Check | Weight | Method |
 |-----|-------|--------|--------|
 | git-identity | No global git user.name/email | 1 | `git config --global` |
+| git-remotes | No China Git hosts (gitee/coding.net) | 0 | Scan `~/` for `.git/config` remotes |
 
 ## 10. Claude (weight: 1/100)
 

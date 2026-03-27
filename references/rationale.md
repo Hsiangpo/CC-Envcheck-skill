@@ -1,4 +1,4 @@
-# CC-Check Rationale & Decision Log v2
+# CC-Check Rationale & Decision Log v3
 
 ## Why These Checks Matter
 
@@ -19,7 +19,12 @@ Modern API providers (Anthropic, OpenAI) use multi-signal fingerprinting to dete
 | Chinese ISP DNS (114/223) | 🔴 Critical | Trivial for API |
 | IP type = hosting/VPN | 🔴 Critical | Trivial for API |
 | TZ / Locale mismatch | 🟡 Medium | Moderate |
-| npm China mirror | 🟡 Medium | Indirect (via registry requests) |
+| npm/pip/GOPROXY China mirror | 🟡 Medium | Indirect (via registry requests) |
+| Docker China registry mirrors | 🟡 Medium | Via pull traffic patterns |
+| Git remote on gitee/coding.net | 🟡 Medium | Via SSH/HTTPS traffic |
+| VS Code Chinese locale | 🟢 Low | Client-local |
+| SSH known_hosts China IPs | 🟢 Low | Client-local |
+| Non-bundled CJK fonts | 🟢 Low | Not transmitted |
 | Git identity | 🟢 Low | Only in error stacks |
 | Username/hostname | 🟢 Low | Only in error stacks |
 | Input method | 🟢 Low | Not transmitted |
@@ -27,19 +32,21 @@ Modern API providers (Anthropic, OpenAI) use multi-signal fingerprinting to dete
 ## Platform-Specific Decisions
 
 ### macOS
-- Use `networksetup` for DNS (more reliable than `scutil --dns` for display values)
-- LaunchAgent for DNS watchdog (Clash Verge periodically overrides display DNS)
+- Use `networksetup` for DNS setting + `scutil` StaticDNS for DHCP-resistant override
+- LaunchAgent for DNS watchdog every 15s (DHCP can re-push suspicious DNS)
 - `plistlib` for input method detection
 
 ### Linux
-- Use `resolvectl` first, fall back to `/etc/resolv.conf`
-- No DNS watchdog needed (NetworkManager doesn't have the display bug)
+- Use `nmcli` with `ignore-auto-dns=yes` for DHCP-resistant DNS
+- Fall back to `systemd-resolved.conf` if nmcli unavailable
+- systemd user timer for DNS watchdog every 15s
 - `gsettings` for input method (GNOME)
 
 ### Windows
 - PowerShell for everything (avoid cmd.exe encoding issues)
+- `netsh` for static DNS (takes priority over DHCP)
+- Task Scheduler for DNS watchdog every 60s
 - Registry for system proxy detection
-- No DNS watchdog needed
 
 ## Important Repair Logic (from original rationale)
 
@@ -69,6 +76,26 @@ The stable end-state this skill is trying to preserve is:
 - Public subscription serves the hardened config
 - Active remote listener on the expected VPN port belongs to the intended runtime
 - System DNS display no longer shows `114.114.114.114`
+- Static DNS locked to safe servers (8.8.8.8 + 1.1.1.1) across all platforms
+- DNS watchdog guards against DHCP re-override (macOS/Linux/Windows)
+
+### Why DHCP-resistant static DNS matters
+
+Home routers push China ISP DNS (e.g. 114.114.114.114) via DHCP. Even after manual cleanup, the router can re-push it on lease renewal. The 3-layer fix:
+1. **networksetup / nmcli / netsh**: Sets manual DNS (survives most DHCP)
+2. **scutil / resolved.conf**: Creates higher-priority DNS override (DHCP cannot overwrite)
+3. **Watchdog timer**: Auto-detects and corrects any drift every 15-60 seconds
+
+### TUN-aware DNS detection
+
+When Clash TUN mode with `dns-hijack` is active, system DNS display values are cosmetic — all real DNS goes through the TUN interface. The `system-dns-display` check downgrades from `fail` to `warn` in this case to avoid false score deductions.
+
+### Why fix-local now also fixes `warn` status (not just `fail`)
+
+DNS in `warn` state (TUN active + suspicious display DNS) is still worth cleaning:
+- Display values propagate to apps that bypass TUN
+- It's a hygiene signal that third-party observers can read
+- The fix is safe and non-disruptive
 
 ## Fix Safety Decisions
 
@@ -78,11 +105,14 @@ The stable end-state this skill is trying to preserve is:
 - git config changes are destructive
 - Users want to see what will change before applying
 
-### Why we don't auto-fix warnings
+### Why we don't auto-fix some warnings
 - Chinese IME: legitimate for bilingual users
 - Cloudflare Asia PoP: NOT equivalent to China ISP
 - Shell history: past data, not current state
 - System language: risky to change globally
+- VS Code locale: user preference, reported as info
+- Non-bundled CJK fonts: reported as info only
+- SSH known_hosts: informational, user may legitimately connect to China servers
 
 ## IP Quality Assessment Logic
 
@@ -108,9 +138,9 @@ IDC-tunneled "residential" IPs (伪住宅) are detected by:
 - **IP Quality (30)**: Highest priority — direct risk signal to API providers, includes multi-channel type/risk/ISP validation
 - **DNS (15)**: Most common leak vector
 - **Network (10)**: IP reachability and consistency
-- **System (21)**: TZ, locale, proxy, language, hostname, user identity
-- **Packages (6)**: China mirrors = strong geo signal
-- **Privacy (6)**: Telemetry control
+- **System (21)**: TZ, locale, proxy, language, hostname, user identity, VS Code, font fingerprints
+- **Packages (6)**: China mirrors (npm/pip/brew/GOPROXY/Docker) = strong geo signal
+- **Privacy (6)**: Telemetry control, SSH known_hosts
 - **Clash (8)**: Proxy client state and TUN
 - **Node.js (2)**: Runtime verification
 - **Identity (1)**: Low risk but still checked
