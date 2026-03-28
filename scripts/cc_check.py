@@ -232,6 +232,40 @@ def fetch_text_url(url: str, timeout: int = 12, retries: int = 2) -> str | None:
     return None
 
 
+def fetch_google_dns_lines() -> list[str]:
+    """获取 Google DNS whoami 输出，Windows 下无 dig 时回退到 DoH。"""
+    r = plat.run_shell("dig +time=3 +tries=1 +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null")
+    lines = [line.strip().strip('"') for line in r.stdout.splitlines() if line.strip()]
+    if lines:
+        return lines
+
+    text = fetch_text_url("https://dns.google/resolve?name=o-o.myaddr.l.google.com&type=TXT", timeout=8, retries=1)
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    answers = payload.get("Answer", [])
+    return [item.get("data", "").strip().strip('"') for item in answers if item.get("data")]
+
+
+def fetch_cloudflare_dns_ip() -> str:
+    """获取 Cloudflare whoami IP，Windows 下无 dig 时回退到 trace 接口。"""
+    r = plat.run_shell("dig +time=3 +tries=1 +short CH TXT whoami.cloudflare @1.1.1.1 2>/dev/null")
+    cf = r.stdout.strip().replace('"', "")
+    if cf:
+        return cf
+
+    text = fetch_text_url("https://1.1.1.1/cdn-cgi/trace", timeout=8, retries=1)
+    if not text:
+        return ""
+    for line in text.splitlines():
+        if line.startswith("ip="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
 def classify_google_dns(lines: list[str], clash_running: bool = False) -> tuple[str, str]:
     """分类 Google DNS whoami 结果。
 
@@ -239,15 +273,19 @@ def classify_google_dns(lines: list[str], clash_running: bool = False) -> tuple[
     应判定为 pass 而不是 warn。
     """
     text = " | ".join(lines)
+    effective_lines = [line for line in lines if "edns0-client-subnet" not in line.lower()]
+    effective_text = " | ".join(effective_lines)
     if not text:
         return "warn", "Google DNS whoami returned empty output"
     if any(m in text for m in FAIL_GOOGLE_MARKERS):
         return "fail", f"Google DNS whoami shows China ISP: {text}"
-    if any(m in text for m in LOW_RISK_GOOGLE_MARKERS) or "edns0-client-subnet" in text:
+    if any(m in effective_text for m in LOW_RISK_GOOGLE_MARKERS) or "edns0-client-subnet" in text:
         if clash_running:
             return "pass", f"Google DNS via Clash DoH (expected): {text}"
         return "warn", f"Google DNS PoP acceptable but not ideal: {text}"
-    return "pass", f"Google DNS whoami clean: {text}"
+    if effective_text:
+        return "pass", f"Google DNS whoami clean: {effective_text}"
+    return "warn", f"Google DNS whoami returned subnet hint only: {text}"
 
 
 # ---------------------------------------------------------------------------
@@ -352,14 +390,12 @@ def inspect_dns(public_ip: str | None) -> list[Finding]:
     findings: list[Finding] = []
 
     # Google DNS whoami
-    r = plat.run_shell("dig +time=3 +tries=1 +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null")
-    lines = [l.strip().strip('"') for l in r.stdout.splitlines() if l.strip()]
+    lines = fetch_google_dns_lines()
     status, summary = classify_google_dns(lines, clash_running=plat.is_clash_running())
     findings.append(Finding("dns", "dns-google", status, summary))
 
     # Cloudflare DNS whoami
-    r = plat.run_shell("dig +time=3 +tries=1 +short CH TXT whoami.cloudflare @1.1.1.1 2>/dev/null")
-    cf = r.stdout.strip().replace('"', "")
+    cf = fetch_cloudflare_dns_ip()
     if public_ip and cf == public_ip:
         findings.append(Finding("dns", "dns-cloudflare", "pass", f"Cloudflare DNS matches egress: {cf}"))
     elif cf:
@@ -731,6 +767,8 @@ def inspect_clash(ctx: Context, public_ip: str | None) -> list[Finding]:
             findings.append(Finding("clash", "dns-cleanup-watchdog", "pass", "DNS watchdog installed"))
         else:
             findings.append(Finding("clash", "dns-cleanup-watchdog", "warn", "DNS watchdog not installed"))
+    elif plat.PLATFORM == "win32":
+        findings.append(Finding("clash", "dns-cleanup-watchdog", "pass", "DNS watchdog not required on Windows"))
     else:
         findings.append(Finding("clash", "dns-cleanup-watchdog", "skip", "DNS watchdog N/A on this platform"))
     return findings
@@ -795,23 +833,39 @@ def collect_findings(ctx: Context, include_vpn: bool = True) -> list[Finding]:
 
 def build_env_block(targets: dict[str, str | None]) -> str:
     lines = [ENV_BLOCK_START]
+    is_windows = plat.PLATFORM == "win32"
+
+    def add_env(name: str, value: str) -> None:
+        if is_windows:
+            escaped = value.replace("'", "''")
+            lines.append(f"$env:{name} = '{escaped}'")
+        else:
+            lines.append(f'export {name}="{value}"')
+
     if targets.get("timezone"):
-        lines.append(f'export TZ="{targets["timezone"]}"')
+        add_env("TZ", targets["timezone"])
     if targets.get("locale"):
-        lines.append(f'export LANG="{targets["locale"]}"')
-        lines.append(f'export LC_ALL="{targets["locale"]}"')
+        add_env("LANG", targets["locale"])
+        add_env("LC_ALL", targets["locale"])
     if targets.get("language"):
-        lines.append(f'export LANGUAGE="{targets["language"]}"')
+        add_env("LANGUAGE", targets["language"])
     if targets.get("proxy_url"):
-        lines.append(f'export HTTP_PROXY="{targets["proxy_url"]}"')
-        lines.append('export HTTPS_PROXY="$HTTP_PROXY"')
-        lines.append('export http_proxy="$HTTP_PROXY"')
-        lines.append('export https_proxy="$HTTP_PROXY"')
-        lines.append('export ALL_PROXY="$HTTP_PROXY"')
-        lines.append('export all_proxy="$HTTP_PROXY"')
-    lines.append('export DISABLE_TELEMETRY="1"')
-    lines.append('export DISABLE_ERROR_REPORTING="1"')
-    lines.append('export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"')
+        add_env("HTTP_PROXY", targets["proxy_url"])
+        if is_windows:
+            lines.append("$env:HTTPS_PROXY = $env:HTTP_PROXY")
+            lines.append("$env:http_proxy = $env:HTTP_PROXY")
+            lines.append("$env:https_proxy = $env:HTTP_PROXY")
+            lines.append("$env:ALL_PROXY = $env:HTTP_PROXY")
+            lines.append("$env:all_proxy = $env:HTTP_PROXY")
+        else:
+            lines.append('export HTTPS_PROXY="$HTTP_PROXY"')
+            lines.append('export http_proxy="$HTTP_PROXY"')
+            lines.append('export https_proxy="$HTTP_PROXY"')
+            lines.append('export ALL_PROXY="$HTTP_PROXY"')
+            lines.append('export all_proxy="$HTTP_PROXY"')
+    add_env("DISABLE_TELEMETRY", "1")
+    add_env("DISABLE_ERROR_REPORTING", "1")
+    add_env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     lines.append(ENV_BLOCK_END)
     return "\n".join(lines)
 

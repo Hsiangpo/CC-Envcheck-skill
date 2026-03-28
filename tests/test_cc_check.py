@@ -292,6 +292,31 @@ class TestLocaleInfo(unittest.TestCase):
         # LANG should come from environment
         self.assertEqual(info.lang, os.environ.get("LANG", ""))
 
+    @patch.object(plat, "PLATFORM", "win32")
+    @patch.object(plat, "run_shell")
+    def test_windows_locale_info_reads_language_list_and_time_format(self, mock_run):
+        """Windows 应优先读取语言列表，并识别 12/24 小时制。"""
+
+        def side_effect(cmd):
+            if "Get-WinUserLanguageList" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "en-US\nzh-Hans-CN\n", "")
+            if "(Get-Culture).Name" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "en-US\n", "")
+            if "CurrentRegion.IsMetric" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "False\n", "")
+            if "ShortTimePattern" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, "h:mm tt\n", "")
+            return subprocess.CompletedProcess(cmd, 1, "", "unexpected command")
+
+        mock_run.side_effect = side_effect
+
+        info = plat.get_locale_info()
+
+        self.assertEqual(info.system_languages, ["en-US", "zh-Hans-CN"])
+        self.assertEqual(info.measurement_units, "Inches")
+        self.assertEqual(info.temperature_unit, "Fahrenheit")
+        self.assertFalse(info.time_format_24h)
+
 
 class TestHostnameInfo(unittest.TestCase):
     """Verify hostname retrieval."""
@@ -317,6 +342,28 @@ class TestHostsFile(unittest.TestCase):
     def test_hosts_check_returns_list(self):
         result = plat.check_hosts_file()
         self.assertIsInstance(result, list)
+
+    @patch.object(plat, "PLATFORM", "win32")
+    def test_windows_hosts_ignores_docker_internal_entries(self):
+        """Windows 常见 Docker hosts 条目不应被误判。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hosts_dir = root / "System32" / "drivers" / "etc"
+            hosts_dir.mkdir(parents=True)
+            hosts_path = hosts_dir / "hosts"
+            hosts_path.write_text(
+                "192.168.0.102 host.docker.internal\n"
+                "192.168.0.102 gateway.docker.internal\n"
+                "127.0.0.1 kubernetes.docker.internal\n"
+                "0.0.0.0 ieonline.microsoft.com\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"SystemRoot": str(root)}):
+                result = plat.check_hosts_file()
+
+        self.assertEqual(result, ["0.0.0.0 ieonline.microsoft.com"])
 
 
 class TestShellProfilePaths(unittest.TestCase):
@@ -421,6 +468,21 @@ class TestWindowsCommandCompatibility(unittest.TestCase):
         self.assertEqual(result["pip"]["index"], "https://pypi.tuna.tsinghua.edu.cn/simple")
         self.assertTrue(result["pip"]["is_china_mirror"])
 
+    @patch.object(plat, "PLATFORM", "win32")
+    @patch.object(plat, "run_shell")
+    def test_windows_timezone_is_mapped_to_iana(self, mock_run):
+        """Windows 时区应映射成 IANA，避免和目标时区字符串不一致。"""
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["pwsh"],
+            0,
+            "America/Los_Angeles\n",
+            "",
+        )
+
+        result = plat.get_system_timezone()
+
+        self.assertEqual(result, "America/Los_Angeles")
+
     def test_find_china_mirror_residue_scans_files_without_shell_tools(self):
         """镜像残留扫描应由 Python 直接完成，而不是依赖 find/grep。"""
 
@@ -470,6 +532,50 @@ class TestFixLocalWindowsSafety(unittest.TestCase):
 
             self.assertFalse(telemetry.exists())
             self.assertIn("Removed Claude telemetry", actions)
+
+    @patch.object(cc_check.plat, "PLATFORM", "win32")
+    def test_build_env_block_uses_powershell_syntax_on_windows(self):
+        """Windows profile 不应写入 export 语法。"""
+        block = cc_check.build_env_block({
+            "timezone": "America/Los_Angeles",
+            "locale": "en_US.UTF-8",
+            "language": "en_US",
+            "proxy_url": "http://127.0.0.1:7897",
+        })
+
+        self.assertIn("$env:TZ = 'America/Los_Angeles'", block)
+        self.assertIn("$env:HTTP_PROXY = 'http://127.0.0.1:7897'", block)
+        self.assertIn("$env:HTTPS_PROXY = $env:HTTP_PROXY", block)
+        self.assertNotIn('export TZ="America/Los_Angeles"', block)
+
+    @patch.object(cc_check.plat, "PLATFORM", "win32")
+    @patch.object(cc_check.plat, "run_shell")
+    @patch.object(cc_check, "fetch_text_url")
+    def test_fetch_cloudflare_dns_ip_falls_back_without_dig(self, mock_fetch_text, mock_run_shell):
+        """Windows 无 dig 时应回退到 Cloudflare trace 接口。"""
+        mock_run_shell.return_value = subprocess.CompletedProcess(["dig"], 1, "", "dig not found")
+        mock_fetch_text.return_value = "ip=104.254.211.203\nloc=US\n"
+
+        result = cc_check.fetch_cloudflare_dns_ip()
+
+        self.assertEqual(result, "104.254.211.203")
+
+    @patch.object(cc_check.plat, "PLATFORM", "win32")
+    @patch.object(cc_check.plat, "run_shell")
+    @patch.object(cc_check, "fetch_text_url")
+    def test_fetch_google_dns_lines_falls_back_without_dig(self, mock_fetch_text, mock_run_shell):
+        """Windows 无 dig 时应回退到 Google DoH。"""
+        mock_run_shell.return_value = subprocess.CompletedProcess(["dig"], 1, "", "dig not found")
+        mock_fetch_text.return_value = (
+            '{"Answer":['
+            '{"data":"\\"edns0-client-subnet 104.254.211.0/24\\""},'
+            '{"data":"\\"172.217.46.24\\""}'
+            ']}'
+        )
+
+        result = cc_check.fetch_google_dns_lines()
+
+        self.assertEqual(result, ["edns0-client-subnet 104.254.211.0/24", "172.217.46.24"])
 
 
 class TestClashVergeDnsToggleSafety(unittest.TestCase):

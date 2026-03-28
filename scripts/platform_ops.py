@@ -150,14 +150,22 @@ def get_locale_info() -> LocaleInfo:
                     lang = lang or line.split("=", 1)[-1].strip()
 
     elif PLATFORM == "win32":
+        r = run_shell("Get-WinUserLanguageList | ForEach-Object { $_.LanguageTag }")
+        if r.returncode == 0:
+            languages = [line.strip() for line in r.stdout.splitlines() if line.strip()]
         r = run_shell("(Get-Culture).Name")
         if r.returncode == 0:
-            languages = [r.stdout.strip()]
+            languages = languages or [r.stdout.strip()]
         r = run_shell("[System.Globalization.RegionInfo]::CurrentRegion.IsMetric")
         if r.returncode == 0:
             is_metric = r.stdout.strip().lower() == "true"
             measurement = "Centimeters" if is_metric else "Inches"
             temperature = "Celsius" if is_metric else "Fahrenheit"
+        r = run_shell("(Get-Culture).DateTimeFormat.ShortTimePattern")
+        if r.returncode == 0:
+            pattern = r.stdout.strip()
+            if pattern:
+                time_24h = "H" in pattern and "h" not in pattern
 
     return LocaleInfo(lang=lang, lc_all=lc_all, system_languages=languages,
                       measurement_units=measurement, temperature_unit=temperature,
@@ -185,7 +193,7 @@ def get_system_timezone() -> str:
         if tz_file.exists():
             return tz_file.read_text().strip()
     elif PLATFORM == "win32":
-        r = run_shell("(Get-TimeZone).Id")
+        r = run_shell("[string]$iana=''; if ([System.TimeZoneInfo]::TryConvertWindowsIdToIanaId((Get-TimeZone).Id, [ref]$iana)) { $iana } else { (Get-TimeZone).Id }")
         if r.returncode == 0:
             return r.stdout.strip()
     return os.environ.get("TZ", "")
@@ -960,6 +968,11 @@ def get_nodejs_env() -> dict[str, str]:
 def check_hosts_file() -> list[str]:
     """检查 hosts 文件中的非标准条目。"""
     suspicious: list[str] = []
+    allowed_win_hosts = {
+        "host.docker.internal",
+        "gateway.docker.internal",
+        "kubernetes.docker.internal",
+    }
     if PLATFORM == "win32":
         hosts_path = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
     else:
@@ -973,6 +986,10 @@ def check_hosts_file() -> list[str]:
         if line in ("127.0.0.1\tlocalhost", "127.0.0.1       localhost",
                     "255.255.255.255\tbroadcasthost", "255.255.255.255 broadcasthost",
                     "::1\tlocalhost", "::1             localhost", "::1 localhost"):
+            continue
+        if PLATFORM == "win32" and any(
+            line.endswith(f" {host}") or line.endswith(f"\t{host}") for host in allowed_win_hosts
+        ):
             continue
         suspicious.append(line)
     return suspicious
