@@ -8,7 +8,7 @@
 
 **50+ 自动化检测 · 100 分制评分 · 分级修复 · 跨平台支持**
 
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0a0a0a?style=flat-square&logo=apple&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![Python](https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/) [![Tests](https://img.shields.io/badge/tests-52%20passed-00C853?style=flat-square&logo=pytest&logoColor=white)](https://github.com/Hsiangpo/CC-check/actions) [![Version](https://img.shields.io/badge/version-1.3.0-FF6F00?style=flat-square&logo=semver&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0a0a0a?style=flat-square&logo=apple&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![Python](https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/) [![Tests](https://img.shields.io/badge/tests-63%20passed-00C853?style=flat-square&logo=pytest&logoColor=white)](https://github.com/Hsiangpo/CC-check/actions) [![Version](https://img.shields.io/badge/version-1.3.0-FF6F00?style=flat-square&logo=semver&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 <br>
 
@@ -86,8 +86,11 @@ python scripts/cc_check.py fix-local --allow-shell-history-cleanup
 # 显式允许输入法改动
 python scripts/cc_check.py fix-local --allow-rime-install --allow-ime-removal
 
-# 浏览器泄露基线检查 + 手工清单
+# 浏览器泄露检查（默认自动探测 Playwright，失败则回退为手工清单）
 python scripts/cc_check.py browser-leaks --json
+
+# 强制关闭自动化，仅输出 Python 基线 + 手工清单
+python scripts/cc_check.py browser-leaks --automation off
 
 # 自定义目标参数
 python scripts/cc_check.py inspect \
@@ -326,9 +329,11 @@ cc-check/
 │   ├── ip_quality.py              # 🌐 5 渠道 IP 质量评估
 │   ├── scoring.py                 # 📊 100 分制评分引擎
 │   ├── vpn_adapter.py             # 🔌 VPN 项目适配器
-│   └── browser_leaks.py           # 🔍 浏览器泄露检测
+│   ├── browser_leaks.py           # 🔍 浏览器泄露检测编排
+│   ├── browser_automation.py      # 🤖 Playwright 能力探测与执行
+│   └── browser_automation_runner.mjs # 🌐 浏览器数据采集 runner
 └── tests/
-    └── test_cc_check.py           # ✅ 44 个单元测试
+    └── test_cc_check.py           # ✅ 63 个单元测试
 ```
 
 ---
@@ -368,7 +373,7 @@ cc-check/
 ## 🧪 测试
 
 ```bash
-# 运行全部 44 个单元测试
+# 运行全部 63 个单元测试
 python -m unittest discover -s tests -v
 
 # CI: macOS + Linux + Windows × Python 3.10/3.11/3.12 = 9 矩阵

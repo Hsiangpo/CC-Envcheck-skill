@@ -12,13 +12,14 @@
 from __future__ import annotations
 
 import json
-import re
 import ssl
 import socket
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
-from urllib.error import URLError
+
+from browser_automation import detect_playwright_support, execute_playwright_runner
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,9 @@ class BrowserFinding:
     status: str        # pass | fail | warn | skip | manual
     summary: str
     details: list[str] = field(default_factory=list)
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +257,40 @@ CHINA_FONTS = {
 def analyze_webrtc(data: dict) -> list[BrowserFinding]:
     """分析 WebRTC 测试结果 (来自浏览器 JS 提取)。"""
     findings: list[BrowserFinding] = []
+    if "localCandidates" in data or "publicCandidates" in data:
+        if not data.get("supported", True):
+            findings.append(BrowserFinding("webrtc", "webrtc-leak", "skip", "WebRTC API not available"))
+            findings.append(BrowserFinding("webrtc", "webrtc-local-ip", "skip", "WebRTC local IP check unavailable"))
+            return findings
+
+        error = str(data.get("error", "")).strip()
+        local_candidates = data.get("localCandidates", []) or []
+        public_candidates = data.get("publicCandidates", []) or []
+        if error:
+            findings.append(BrowserFinding("webrtc", "webrtc-leak", "warn", f"WebRTC collection error: {error}"))
+        elif public_candidates:
+            findings.append(BrowserFinding(
+                "webrtc",
+                "webrtc-leak",
+                "fail",
+                f"WebRTC exposes public candidates: {', '.join(public_candidates[:3])}",
+                public_candidates[:5],
+            ))
+        else:
+            findings.append(BrowserFinding("webrtc", "webrtc-leak", "pass", "WebRTC public IP not exposed"))
+
+        if local_candidates:
+            findings.append(BrowserFinding(
+                "webrtc",
+                "webrtc-local-ip",
+                "fail",
+                f"WebRTC exposes local IP: {', '.join(local_candidates[:3])}",
+                local_candidates[:5],
+            ))
+        else:
+            findings.append(BrowserFinding("webrtc", "webrtc-local-ip", "pass", "WebRTC local IP not exposed"))
+        return findings
+
     leak = data.get("WebRTC Leak Test", "").lower()
     local_ip = data.get("Local IP Address", "-")
     public_ip = data.get("Public IP Address", "-")
@@ -319,11 +357,47 @@ def analyze_javascript(data: dict) -> list[BrowserFinding]:
     return findings
 
 
-def analyze_fonts(font_list_text: str) -> list[BrowserFinding]:
+def analyze_browser_ip(data: dict) -> list[BrowserFinding]:
+    """分析浏览器上下文发出的多端点 IP 结果。"""
+    findings: list[BrowserFinding] = []
+    endpoints = data.get("endpoints", data if isinstance(data, dict) else {})
+    ips = {name: str(value).strip() for name, value in endpoints.items() if str(value).strip()}
+    unique_ips = set(ips.values())
+
+    if len(unique_ips) == 1 and ips:
+        findings.append(BrowserFinding(
+            "ip",
+            "browser-multi-endpoint-consistency",
+            "pass",
+            f"Browser endpoints agree on IP: {next(iter(unique_ips))}",
+            [f"{name}: {ip}" for name, ip in ips.items()],
+        ))
+    elif len(unique_ips) > 1:
+        findings.append(BrowserFinding(
+            "ip",
+            "browser-multi-endpoint-consistency",
+            "fail",
+            f"Browser endpoints returned {len(unique_ips)} different IPs",
+            [f"{name}: {ip}" for name, ip in ips.items()],
+        ))
+    else:
+        findings.append(BrowserFinding(
+            "ip",
+            "browser-multi-endpoint-consistency",
+            "skip",
+            "Browser context could not reach any IP endpoint",
+        ))
+    return findings
+
+
+def analyze_fonts(font_data: Any) -> list[BrowserFinding]:
     """分析字体列表是否包含中文字体。"""
     findings: list[BrowserFinding] = []
-    lower = font_list_text.lower()
-    found_china = [f for f in CHINA_FONTS if f in lower]
+    if isinstance(font_data, dict):
+        found_china = [str(font) for font in font_data.get("detectedFonts", []) if str(font).strip()]
+    else:
+        lower = str(font_data).lower()
+        found_china = [f for f in CHINA_FONTS if f in lower]
     if found_china:
         findings.append(BrowserFinding("fonts", "china-fonts", "warn",
                                        f"Found {len(found_china)} Chinese font(s) in browser",
@@ -346,19 +420,23 @@ def run_python_checks() -> list[BrowserFinding]:
     return findings
 
 
-def build_report_payload(findings: list[BrowserFinding]) -> dict[str, Any]:
-    """构建带自动项和手工清单的结构化结果。"""
-    automated = [
-        {
-            "test": finding.test,
-            "key": finding.key,
-            "status": finding.status,
-            "summary": finding.summary,
-            "details": finding.details,
-        }
-        for finding in findings
-    ]
-    manual = [
+def _default_report_meta() -> dict[str, Any]:
+    """返回浏览器检测报告的默认元数据。"""
+    return {
+        "mode": "python-baseline-plus-manual-checklist",
+        "automation_supported": False,
+        "automation_used": False,
+        "provider": "playwright",
+        "reason": "",
+        "executed_tests": [],
+        "errors": [],
+    }
+
+
+def _manual_checklist(executed_tests: list[str] | None = None) -> list[dict[str, Any]]:
+    """返回仍需要人工确认的浏览器检测项。"""
+    executed = set(executed_tests or [])
+    return [
         {
             "test": item["test"],
             "name": item["name"],
@@ -369,12 +447,99 @@ def build_report_payload(findings: list[BrowserFinding]) -> dict[str, Any]:
             "fail_indicators": item["fail_indicators"],
         }
         for item in BROWSER_TESTS
+        if item["test"] not in executed
+    ]
+
+
+def detect_playwright_automation() -> dict[str, Any]:
+    """探测是否可使用 Playwright 自动化浏览器检测。"""
+    return detect_playwright_support(SCRIPT_DIR)
+
+
+def run_playwright_automation() -> dict[str, Any]:
+    """执行 Playwright 自动化并将原始结果转换为浏览器发现项。"""
+    payload = execute_playwright_runner(SCRIPT_DIR)
+    findings: list[BrowserFinding] = []
+    executed_tests = list(payload.get("executed_tests", []))
+    results = payload.get("results", {})
+
+    analyzers = {
+        "javascript": analyze_javascript,
+        "webrtc": analyze_webrtc,
+        "ip": analyze_browser_ip,
+        "fonts": analyze_fonts,
+    }
+    for test_name in executed_tests:
+        analyzer = analyzers.get(test_name)
+        if not analyzer:
+            continue
+        raw_data = results.get(test_name, {})
+        findings.extend(analyzer(raw_data))
+
+    return {
+        "provider": payload.get("provider", "playwright"),
+        "findings": findings,
+        "executed_tests": executed_tests,
+        "errors": payload.get("errors", []),
+        "ok": payload.get("ok", False),
+    }
+
+
+def run_browser_checks(automation: str = "auto") -> tuple[list[BrowserFinding], dict[str, Any]]:
+    """运行浏览器检测并在可用时自动接入 Playwright。"""
+    findings = run_python_checks()
+    meta = _default_report_meta()
+    if automation == "off":
+        meta["reason"] = "automation disabled"
+        return findings, meta
+
+    capability = detect_playwright_automation()
+    meta["provider"] = capability.get("provider", "playwright")
+    meta["automation_supported"] = bool(capability.get("available"))
+    meta["reason"] = capability.get("reason", "")
+    if not capability.get("available"):
+        return findings, meta
+
+    automation_result = run_playwright_automation()
+    meta["errors"] = automation_result.get("errors", [])
+    executed_tests = automation_result.get("executed_tests", [])
+    if not executed_tests:
+        if meta["errors"]:
+            meta["reason"] = meta["errors"][0]
+        return findings, meta
+
+    findings.extend(automation_result.get("findings", []))
+    meta.update({
+        "mode": "playwright-automation-plus-python-baseline",
+        "automation_used": True,
+        "executed_tests": executed_tests,
+    })
+    return findings, meta
+
+
+def build_report_payload(findings: list[BrowserFinding], report_meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    """构建带自动项和手工清单的结构化结果。"""
+    report_meta = {**_default_report_meta(), **(report_meta or {})}
+    automated = [
+        {
+            "test": finding.test,
+            "key": finding.key,
+            "status": finding.status,
+            "summary": finding.summary,
+            "details": finding.details,
+        }
+        for finding in findings
     ]
     return {
-        "mode": "python-baseline-plus-manual-checklist",
-        "automation_supported": False,
+        "mode": report_meta["mode"],
+        "automation_supported": report_meta["automation_supported"],
+        "automation_used": report_meta["automation_used"],
+        "provider": report_meta["provider"],
+        "reason": report_meta["reason"],
+        "executed_tests": report_meta["executed_tests"],
+        "errors": report_meta["errors"],
         "automated": automated,
-        "manual": manual,
+        "manual": _manual_checklist(report_meta["executed_tests"]),
     }
 
 
@@ -382,8 +547,9 @@ def build_report_payload(findings: list[BrowserFinding]) -> dict[str, Any]:
 # Print results
 # ---------------------------------------------------------------------------
 
-def print_browser_report(findings: list[BrowserFinding], browser_available: bool = False) -> None:
+def print_browser_report(findings: list[BrowserFinding], report_meta: dict[str, Any] | None = None) -> None:
     """输出浏览器泄露检测报告。"""
+    report_meta = {**_default_report_meta(), **(report_meta or {})}
     status_icon = {"pass": "✅", "fail": "❌", "warn": "⚠️ ", "skip": "⏭️ ", "manual": "🔍"}
 
     print("\n" + "=" * 50)
@@ -396,21 +562,26 @@ def print_browser_report(findings: list[BrowserFinding], browser_available: bool
         for d in f.details:
             print(f"      · {d}")
 
-    if not browser_available:
+    if report_meta["automation_used"]:
+        executed = ", ".join(report_meta["executed_tests"]) or "none"
         print("\n" + "-" * 50)
-        print("  📋 Browser-only tests (requires manual check or Chrome DevTools MCP):")
+        print(f"  🤖 Automation: {report_meta['provider']} ({executed})")
+    elif report_meta["reason"]:
+        print("\n" + "-" * 50)
+        print(f"  ℹ️  Automation unavailable: {report_meta['reason']}")
+
+    manual_items = _manual_checklist(report_meta["executed_tests"])
+    if manual_items:
+        print("\n" + "-" * 50)
+        print("  📋 Browser-only tests (requires manual check or extra browser tooling):")
         print()
-        for t in BROWSER_TESTS:
+        for t in manual_items:
             emoji = "🔴" if t["critical"] else "🟡"
             print(f"  {emoji} {t['name']}")
             print(f"     URL: {t['url']}")
             print(f"     检查: {t['pass_criteria']}")
             print()
-        print("  💡 Instructions for LLM agents:")
-        print("     If Chrome DevTools MCP is available, navigate to each URL")
-        print("     and use evaluate_script with the provided js_extract functions")
-        print("     to automatically extract and analyze results.")
-        print("     Otherwise, prompt the user to open the URLs manually.")
+        print("  💡 Remaining manual checks focus on tests that are not yet automated.")
     print()
 
 
@@ -419,5 +590,5 @@ def print_browser_report(findings: list[BrowserFinding], browser_available: bool
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    findings = run_python_checks()
-    print_browser_report(findings, browser_available=False)
+    findings, report_meta = run_browser_checks()
+    print_browser_report(findings, report_meta)

@@ -1194,6 +1194,12 @@ def main() -> int:
 
     bl_sp = sub.add_parser("browser-leaks", help="Run browser leak baseline checks plus manual checklist")
     bl_sp.add_argument("--json", action="store_true", help="Output as JSON")
+    bl_sp.add_argument(
+        "--automation",
+        choices=("auto", "off"),
+        default="auto",
+        help="Whether to auto-run optional Playwright browser checks",
+    )
 
     dns_sp = sub.add_parser("fix-system-dns-display")
     dns_sp.add_argument("--quiet", action="store_true")
@@ -1208,11 +1214,11 @@ def main() -> int:
             return 0
 
         if args.command == "browser-leaks":
-            findings = bleaks.run_python_checks()
+            findings, report_meta = bleaks.run_browser_checks(getattr(args, "automation", "auto"))
             if getattr(args, "json", False):
-                print(json.dumps(bleaks.build_report_payload(findings), ensure_ascii=False, indent=2))
+                print(json.dumps(bleaks.build_report_payload(findings, report_meta), ensure_ascii=False, indent=2))
             else:
-                bleaks.print_browser_report(findings, browser_available=False)
+                bleaks.print_browser_report(findings, report_meta)
             return 0
 
         if args.command == "inspect":

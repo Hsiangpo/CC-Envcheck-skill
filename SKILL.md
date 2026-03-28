@@ -93,8 +93,11 @@ python3 <path>/scripts/cc_check.py fix-local --allow-rime-install --allow-ime-re
 # Full cycle
 python3 <path>/scripts/cc_check.py full
 
-# Browser baseline + manual checklist
+# Browser baseline + optional Playwright automation
 python3 <path>/scripts/cc_check.py browser-leaks --json
+
+# Disable browser automation and keep manual checklist only
+python3 <path>/scripts/cc_check.py browser-leaks --automation off
 
 # With overrides
 python3 <path>/scripts/cc_check.py inspect \
@@ -210,18 +213,20 @@ Do not promise full parity across platforms unless the implementation actually h
 
 ## Browser Leak Detection
 
-The `browser-leaks` subcommand currently runs **Python-level baseline checks** plus returns a **manual browser checklist** (URLs + pass/fail guidance) in both text and JSON modes. The WebRTC / JavaScript / Canvas / font fingerprint analysis logic exists in `browser_leaks.py` but is NOT automatically invoked by the CLI — it still requires a browser automation layer (Playwright/Selenium/CDP MCP) that is not bundled. Describe this capability as "browser leak detection framework" rather than "full automated browser detection".
+The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can collect browser-side WebRTC / JavaScript runtime / IP / font signals; tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing.
 
 ## Architecture
 
 ```
 scripts/
 ├── cc_check.py        # Main orchestrator & CLI (~1100 lines)
+├── browser_automation.py  # Playwright capability detection & subprocess bridge
+├── browser_automation_runner.mjs # Browser-side data collector
+├── browser_leaks.py   # Browser leak detection orchestration
 ├── ip_quality.py      # Multi-channel IP quality assessment
 ├── platform_ops.py    # Cross-platform abstraction layer (~1500 lines)
 ├── scoring.py         # 100-point scoring system
-├── vpn_adapter.py     # VPN project adapter
-└── browser_leaks.py   # Browser leak detection
+└── vpn_adapter.py     # VPN project adapter
 ```
 
 ## References

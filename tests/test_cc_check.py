@@ -789,6 +789,76 @@ class TestBrowserLeaksReporting(unittest.TestCase):
         self.assertEqual(len(payload["manual"]), len(bleaks.BROWSER_TESTS))
         self.assertTrue(payload["manual"][0]["url"].startswith("https://browserleaks.com/"))
 
+    def test_build_report_payload_with_playwright_metadata(self):
+        findings = [
+            bleaks.BrowserFinding("javascript", "js-locale", "pass", "Browser locale: en-US"),
+        ]
+        meta = {
+            "mode": "playwright-automation-plus-python-baseline",
+            "automation_supported": True,
+            "automation_used": True,
+            "provider": "playwright",
+            "executed_tests": ["javascript", "webrtc"],
+        }
+
+        payload = bleaks.build_report_payload(findings, meta)
+
+        self.assertEqual(payload["mode"], "playwright-automation-plus-python-baseline")
+        self.assertTrue(payload["automation_supported"])
+        self.assertTrue(payload["automation_used"])
+        self.assertEqual(payload["provider"], "playwright")
+        self.assertEqual(payload["executed_tests"], ["javascript", "webrtc"])
+        self.assertEqual([item["test"] for item in payload["manual"]], ["ip", "fonts", "canvas", "tls"])
+
+    @patch.object(bleaks, "run_python_checks")
+    @patch.object(bleaks, "detect_playwright_automation")
+    def test_run_browser_checks_falls_back_when_playwright_unavailable(self, mock_detect, mock_python):
+        mock_detect.return_value = {
+            "available": False,
+            "provider": "playwright",
+            "reason": "playwright package not found",
+        }
+        mock_python.return_value = [
+            bleaks.BrowserFinding("ip", "multi-endpoint-consistency", "pass", "All endpoints match"),
+        ]
+
+        findings, meta = bleaks.run_browser_checks()
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(meta["mode"], "python-baseline-plus-manual-checklist")
+        self.assertFalse(meta["automation_supported"])
+        self.assertFalse(meta["automation_used"])
+        self.assertEqual(meta["provider"], "playwright")
+        self.assertEqual(meta["executed_tests"], [])
+
+    @patch.object(bleaks, "run_playwright_automation")
+    @patch.object(bleaks, "run_python_checks")
+    @patch.object(bleaks, "detect_playwright_automation")
+    def test_run_browser_checks_uses_playwright_when_available(self, mock_detect, mock_python, mock_playwright):
+        mock_detect.return_value = {
+            "available": True,
+            "provider": "playwright",
+            "reason": "",
+        }
+        mock_python.return_value = [
+            bleaks.BrowserFinding("ip", "multi-endpoint-consistency", "pass", "All endpoints match"),
+        ]
+        mock_playwright.return_value = {
+            "findings": [
+                bleaks.BrowserFinding("javascript", "js-locale", "pass", "Browser locale: en-US"),
+            ],
+            "executed_tests": ["javascript"],
+            "errors": [],
+        }
+
+        findings, meta = bleaks.run_browser_checks()
+
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(meta["mode"], "playwright-automation-plus-python-baseline")
+        self.assertTrue(meta["automation_supported"])
+        self.assertTrue(meta["automation_used"])
+        self.assertEqual(meta["executed_tests"], ["javascript"])
+
 
 class TestExtendedInspectHelpers(unittest.TestCase):
     """验证新增扩展检查的基础回归。"""
