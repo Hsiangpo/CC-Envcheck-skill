@@ -8,11 +8,7 @@
 
 **50+ 自动化检测 · 100 分制评分 · 一键修复 · 跨平台支持**
 
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0a0a0a?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/Hsiangpo/CC-check)
-[![Python](https://img.shields.io/badge/python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-44%20passed-00C853?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/Hsiangpo/CC-check/actions)
-[![Version](https://img.shields.io/badge/version-1.3.0-FF6F00?style=for-the-badge&logo=semver&logoColor=white)](https://github.com/Hsiangpo/CC-check)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0a0a0a?style=flat-square&logo=apple&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![Python](https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/) [![Tests](https://img.shields.io/badge/tests-44%20passed-00C853?style=flat-square&logo=pytest&logoColor=white)](https://github.com/Hsiangpo/CC-check/actions) [![Version](https://img.shields.io/badge/version-1.3.0-FF6F00?style=flat-square&logo=semver&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 <br>
 
