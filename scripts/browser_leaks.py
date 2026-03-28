@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
 
+from browser_artifacts import default_artifact_dir, save_browser_artifact
 from browser_automation import detect_playwright_support, execute_playwright_runner
 from browser_scoring import build_browser_score_payload, compute_browser_score
 
@@ -583,6 +584,8 @@ def _default_report_meta() -> dict[str, Any]:
         "executed_tests": [],
         "errors": [],
         "browser_score": None,
+        "artifact_path": "",
+        "raw_results": {},
     }
 
 
@@ -657,6 +660,50 @@ def build_browser_recommendations(findings: list[BrowserFinding], report_meta: d
     return recommendations
 
 
+def refine_webrtc_findings(
+    findings: list[BrowserFinding],
+    webrtc_data: dict[str, Any],
+    browser_ip_data: dict[str, Any],
+) -> list[BrowserFinding]:
+    """按浏览器出口 IP 细化 WebRTC public candidate 的风险级别。"""
+    public_candidates = [
+        str(candidate).strip()
+        for candidate in (webrtc_data.get("publicCandidates", []) or [])
+        if str(candidate).strip() and str(candidate).strip() not in {"0.0.0.0", "::", "::0"}
+    ]
+    browser_ips = {
+        str(value).strip()
+        for value in (browser_ip_data.get("endpoints", {}) or {}).values()
+        if str(value).strip()
+    }
+    if not public_candidates or not browser_ips:
+        return findings
+
+    refined: list[BrowserFinding] = []
+    for finding in findings:
+        if finding.key != "webrtc-leak":
+            refined.append(finding)
+            continue
+        unexpected = [candidate for candidate in public_candidates if candidate not in browser_ips]
+        if unexpected:
+            refined.append(BrowserFinding(
+                "webrtc",
+                "webrtc-leak",
+                "fail",
+                f"WebRTC exposes unexpected public candidates: {', '.join(unexpected[:3])}",
+                unexpected[:5],
+            ))
+        else:
+            refined.append(BrowserFinding(
+                "webrtc",
+                "webrtc-leak",
+                "warn",
+                f"WebRTC exposes proxy egress candidate: {', '.join(public_candidates[:3])}",
+                public_candidates[:5],
+            ))
+    return refined
+
+
 def detect_playwright_automation() -> dict[str, Any]:
     """探测是否可使用 Playwright 自动化浏览器检测。"""
     return detect_playwright_support(SCRIPT_DIR)
@@ -684,6 +731,7 @@ def run_playwright_automation() -> dict[str, Any]:
             continue
         raw_data = results.get(test_name, {})
         findings.extend(analyzer(raw_data))
+    findings = refine_webrtc_findings(findings, results.get("webrtc", {}), results.get("ip", {}))
 
     return {
         "provider": payload.get("provider", "playwright"),
@@ -731,7 +779,14 @@ def run_browser_checks(automation: str = "auto") -> tuple[list[BrowserFinding], 
         "automation_used": True,
         "executed_tests": executed_tests,
         "browser_score": build_browser_score_payload(compute_browser_score(browser_only_findings)),
+        "raw_results": automation_result.get("results", {}),
     })
+    artifact_payload = build_report_payload(findings, meta)
+    meta["artifact_path"] = save_browser_artifact(
+        artifact_payload,
+        meta["raw_results"],
+        default_artifact_dir(SCRIPT_DIR.parent),
+    )
     return findings, meta
 
 
@@ -757,6 +812,7 @@ def build_report_payload(findings: list[BrowserFinding], report_meta: dict[str, 
         "executed_tests": report_meta["executed_tests"],
         "errors": report_meta["errors"],
         "browser_score": report_meta["browser_score"],
+        "artifact_path": report_meta["artifact_path"],
         "automated": automated,
         "manual": _manual_checklist(report_meta["executed_tests"]),
         "recommendations": build_browser_recommendations(findings, report_meta),
@@ -789,6 +845,8 @@ def print_browser_report(findings: list[BrowserFinding], report_meta: dict[str, 
         if report_meta["browser_score"]:
             score = report_meta["browser_score"]
             print(f"  🧮 Browser Score: {score['total_score']}/{score['max_score']}  Grade: {score['grade']}  ({score['percentage']}%)")
+        if report_meta["artifact_path"]:
+            print(f"  📁 Artifact: {report_meta['artifact_path']}")
     elif report_meta["reason"]:
         print("\n" + "-" * 50)
         print(f"  ℹ️  Automation unavailable: {report_meta['reason']}")

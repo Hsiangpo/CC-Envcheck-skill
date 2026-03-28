@@ -99,6 +99,7 @@ python scripts/browser_bootstrap.py install --dry-run
 
 # browser-leaks 的 JSON 会带 browser_score 字段
 # browser_bootstrap.py status 会带 tools/proxy_env/install_commands/recommendations
+# 自动化成功时，browser-leaks JSON 还会带 artifact_path，指向本次证据文件
 
 # 自定义目标参数
 python scripts/cc_check.py inspect \
@@ -341,6 +342,7 @@ cc-check/
 │   ├── browser_automation.py      # 🤖 Playwright 能力探测与执行
 │   ├── browser_automation_runner.mjs # 🌐 浏览器数据采集 runner
 │   ├── browser_bootstrap.py       # 📦 本地 Playwright 引导脚本
+│   ├── browser_artifacts.py       # 📁 浏览器自动化证据落盘
 │   └── browser_scoring.py         # 🧮 浏览器自动化评分
 └── tests/
     ├── test_browser_support.py    # ✅ 浏览器评分与引导诊断测试
@@ -384,7 +386,7 @@ cc-check/
 ## 🧪 测试
 
 ```bash
-# 运行全部 75 个单元测试
+# 运行全部 81 个单元测试
 python -m unittest discover -s tests -v
 
 # CI: macOS + Linux + Windows × Python 3.10/3.11/3.12 = 9 矩阵

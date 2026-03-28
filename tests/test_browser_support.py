@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import browser_bootstrap as bboot
+import browser_artifacts as barts
 import browser_leaks as bleaks
 import browser_scoring as bscore
 
@@ -79,6 +81,35 @@ class TestBrowserScoring(unittest.TestCase):
 
         self.assertEqual(recommendations[0]["key"], "automation-bootstrap")
 
+    def test_refine_webrtc_findings_downgrades_proxy_only_candidate(self):
+        findings = [
+            bleaks.BrowserFinding("webrtc", "webrtc-leak", "fail", "raw"),
+            bleaks.BrowserFinding("webrtc", "webrtc-local-ip", "pass", "ok"),
+        ]
+
+        refined = bleaks.refine_webrtc_findings(
+            findings,
+            {"publicCandidates": ["104.254.211.203"]},
+            {"endpoints": {"ipify": "104.254.211.203"}},
+        )
+
+        self.assertEqual(refined[0].status, "warn")
+        self.assertIn("proxy egress candidate", refined[0].summary)
+
+    def test_refine_webrtc_findings_ignores_zero_placeholder(self):
+        findings = [
+            bleaks.BrowserFinding("webrtc", "webrtc-leak", "pass", "raw"),
+            bleaks.BrowserFinding("webrtc", "webrtc-local-ip", "pass", "ok"),
+        ]
+
+        refined = bleaks.refine_webrtc_findings(
+            findings,
+            {"publicCandidates": ["0.0.0.0"]},
+            {"endpoints": {"ipify": "104.247.120.78"}},
+        )
+
+        self.assertEqual(refined[0].status, "pass")
+
 
 class TestBrowserBootstrapStatus(unittest.TestCase):
     """验证本地 Playwright 引导状态输出。"""
@@ -97,6 +128,24 @@ class TestBrowserBootstrapStatus(unittest.TestCase):
 
         self.assertEqual(payload["proxy_env"]["HTTPS_PROXY"], "http://127.0.0.1:7897")
         self.assertEqual(len(payload["install_commands"]), 2)
+
+
+class TestBrowserArtifacts(unittest.TestCase):
+    """验证浏览器证据文件保存。"""
+
+    def test_save_browser_artifact_writes_json_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = barts.save_browser_artifact(
+                {"mode": "test"},
+                {"ip": {"endpoints": {"ipify": "1.1.1.1"}}},
+                Path(tmpdir),
+            )
+
+            saved = Path(path)
+            self.assertTrue(saved.exists())
+            payload = json.loads(saved.read_text(encoding="utf-8"))
+            self.assertEqual(payload["payload"]["mode"], "test")
+            self.assertEqual(payload["raw_results"]["ip"]["endpoints"]["ipify"], "1.1.1.1")
 
 
 if __name__ == "__main__":

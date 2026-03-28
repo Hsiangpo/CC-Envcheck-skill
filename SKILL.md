@@ -105,6 +105,7 @@ python3 <path>/scripts/browser_bootstrap.py install --dry-run
 
 # browser-leaks JSON includes browser_score when automation runs
 # browser_bootstrap status includes tools/proxy_env/install_commands/recommendations
+# automation success also emits artifact_path for the saved evidence file
 
 # With overrides
 python3 <path>/scripts/cc_check.py inspect \
@@ -220,7 +221,7 @@ Do not promise full parity across platforms unless the implementation actually h
 
 ## Browser Leak Detection
 
-The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can collect browser-side WebRTC / JavaScript runtime / browser egress IP / font / Canvas / WebGL / TLS page signals, compare browser egress with the Python baseline egress, and emit a dedicated `browser_score` summary. Tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing and the bootstrap helper reports local install commands plus proxy/tool diagnostics.
+The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can collect browser-side WebRTC / JavaScript runtime / browser egress IP / font / Canvas / WebGL / TLS page signals, compare browser egress with the Python baseline egress, emit a dedicated `browser_score` summary, and save a JSON evidence artifact whose path is returned as `artifact_path`. Tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing and the bootstrap helper reports local install commands plus proxy/tool diagnostics.
 
 ## Architecture
 
@@ -229,6 +230,7 @@ scripts/
 ├── cc_check.py        # Main orchestrator & CLI (~1100 lines)
 ├── browser_automation.py  # Playwright capability detection & subprocess bridge
 ├── browser_automation_runner.mjs # Browser-side data collector
+├── browser_artifacts.py   # Browser evidence persistence
 ├── browser_bootstrap.py   # Optional local Playwright bootstrap helper
 ├── browser_scoring.py     # Browser automation scoring
 ├── browser_leaks.py   # Browser leak detection orchestration
