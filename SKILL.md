@@ -40,6 +40,26 @@ Do NOT use this skill for:
 
 Use `--dry-run` on any fix command to preview changes without applying them.
 
+## ⚠️ LLM Interaction Requirements
+
+Before running `fix-local`, the LLM **MUST** warn the user and get explicit consent for the following high-risk operations. Do NOT silently execute them.
+
+### MUST ASK before executing:
+
+| Operation | Risk | What to tell the user |
+|-----------|------|----------------------|
+| `clean_shell_history()` | Shell history lines matching China-related keywords will be deleted. Keyword list is broad (includes `wechat`, `jd.com`, `alibaba` etc.) and may accidentally remove legitimate commands. | "检测到 Shell 历史中包含中国域名相关记录。清理会按关键词整行删除，可能误删正常命令。是否继续？建议先用 `--dry-run` 预览。" |
+| `install_rime()` | Installs RIME input method (via brew/apt/choco). This is a system-level software installation. | "检测到当前使用系统自带中文输入法，建议安装 RIME（隐蔽型中文输入法）。这会在系统上安装新软件。是否继续？" |
+| `remove_system_chinese_ime()` | Removes system Chinese input methods (Pinyin, Wubi, etc.). Directly modifies user input method configuration. | "将移除系统自带中文输入法（拼音/五笔等）。这是不可逆操作，移除后需要手动重新添加。是否继续？" |
+
+### MUST WARN before executing:
+
+| Operation | Condition | What to tell the user |
+|-----------|-----------|----------------------|
+| `set_static_dns()` | Triggers on both `fail` and `warn` | "将锁定系统 DNS 为静态设置（防止 DHCP 覆盖）。当 TUN 已接管 DNS 时，这是表面修复，但仍会持久改变系统网络配置。" |
+| `install_dns_watchdog()` | Auto-installs LaunchAgent/systemd timer | "将安装 DNS 守护进程（每 15 秒自动校正 DNS）。这是系统级后台任务。" |
+| DNS watchdog on Windows | Requires admin privileges | "Windows 下 DNS 守护任务需要管理员权限运行。如果当前非管理员权限，任务可能创建成功但执行失败。请以管理员身份运行。" |
+
 ## Commands
 
 ```bash
@@ -84,47 +104,74 @@ The skill currently groups checks into:
 
 ## Scoring
 
-Each check has a weight. The total is aggregated into a percentage and letter grade.
+Each check has a weight (total = 100). Groups and weights:
+
+| Group | Weight | Key checks |
+|-------|--------|------------|
+| ip-quality | 30 | IP classification (residential/proxy/idc) |
+| system | 21 | timezone, locale, proxy-env, hostname, hosts |
+| dns | 15 | Google DNS, Cloudflare DNS, system DNS display |
+| network | 10 | public IP, multi-source IP, IPv6 leak |
+| clash | 8 | process, mode, TUN, markers, watchdog |
+| packages | 6 | npm, pip, brew |
+| privacy | 6 | telemetry, sessions, env, shell-history |
+| nodejs | 2 | node TZ, node locale |
+| identity | 1 | git identity |
+| claude | 1 | Claude language |
+
+Realistic example (first-time audit, DNS cosmetic + pip mirror + shell history issues):
 
 ```
 ╔════════════════════════════════════════════╗
-║  CC-Check Score:  87 / 100  Grade: B  (87.0%)  ║
+║  CC-Check Score:  86 / 100  Grade: B   (86.0%)  ║
 ╠════════════════════════════════════════════╣
-║  network      8/15   ████████░░  85.0%  ║
-║  dns         16/16   ██████████ 100.0%  ║
-║  system      25/25   ██████████ 100.0%  ║
-║  ...                                      ║
+║  ip-quality     30/30   ██████████  100.0%  ║
+║  system         21/21   ██████████  100.0%  ║
+║  dns            10/15   ██████░░░░   66.7%  ║
+║  network        10/10   ██████████  100.0%  ║
+║  clash           7/8    █████████░   87.5%  ║
+║  packages        4/6    ██████░░░░   66.7%  ║
+║  privacy         5/6    ████████░░   83.3%  ║
+║  nodejs          2/2    ██████████  100.0%  ║
+║  identity        1/1    ██████████  100.0%  ║
+║  claude          1/1    ██████████  100.0%  ║
 ╚════════════════════════════════════════════╝
 ```
 
+Note: 6 informational checks (GOPROXY, Docker mirror, git remotes, VS Code locale, SSH known_hosts, font fingerprint) have `weight=0` and appear as ⚠️ warnings but do not affect the score.
+
 ## Fix Policy
 
-### `fix-local` may safely mutate:
+### `fix-local` auto-executes (no user consent needed):
 - Shell profile files (`~/.zprofile`, `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, or PowerShell `$PROFILE`)
 - `~/.claude/` telemetry data
 - Global git config (`user.name`, `user.email`)
-- System DNS: cross-platform DHCP-resistant static DNS (`set_static_dns()`)
-  - macOS: `networksetup` + `scutil` StaticDNS override (DHCP cannot override)
-  - Linux: `nmcli` with `ignore-auto-dns=yes` or `resolved.conf` fallback
-  - Windows: `netsh` static DNS mode
-- DNS cleanup watchdog (macOS LaunchAgent / Linux systemd timer, 15s auto-correction)
 - npm / pip / brew registry reset
+
+### `fix-local` auto-executes with LLM WARNING (see LLM Interaction Requirements):
+- System DNS: DHCP-resistant static DNS (`set_static_dns()`)
+  - macOS: `networksetup` + `scutil` StaticDNS override
+  - Linux: `nmcli` with `ignore-auto-dns=yes` or `resolved.conf` fallback
+  - Windows: `netsh` static DNS mode (⚠️ requires admin privileges)
+- DNS cleanup watchdog (macOS LaunchAgent / Linux systemd timer / Windows Task Scheduler)
+
+### `fix-local` requires EXPLICIT USER CONSENT (see LLM Interaction Requirements):
+- Shell history cleanup (`clean_shell_history()`) — keyword-based deletion, may cause data loss
+- RIME input method installation (`install_rime()`) — installs system software
+- System Chinese IME removal (`remove_system_chinese_ime()`) — irreversible input method change
 
 ### `fix-vpn` may safely mutate:
 - Generated files in the detected VPN project root
 - Public subscription state via detected deploy script
 - Remote VPN service state on configured host
 
-Both fix commands touch items marked as `fail` or `warn` (DNS is fixed on warn too, since TUN-mode DNS is cosmetic but still worth cleaning).
-
-## Low-Risk Findings (reported as `warn`, not auto-fixed)
+## Low-Risk Findings (reported as `warn`, score impact varies)
 
 - Claude settings language is Chinese
-- Active input method is Pinyin / SCIM
 - Google DNS whoami returns Cloudflare Asia PoP
 - IP quality uncertain but not flagged
-- Shell history contains China domain references
 - System measurement units / time format mismatch
+- 0-weight informational items: GOPROXY, Docker mirror, git remotes, VS Code locale, SSH known_hosts, font fingerprint
 
 ## Privacy Rules
 
@@ -138,8 +185,13 @@ Both fix commands touch items marked as `fail` or `warn` (DNS is fixed on warn t
 - **macOS**: fullest inspection and repair support (3-layer DNS protection)
 - **Linux**: full inspection + nmcli/resolved DNS fix + systemd watchdog
 - **Windows**: full inspection + netsh static DNS fix + Task Scheduler watchdog
+  - ⚠️ DNS watchdog needs admin/elevated privileges; code creates the task but `Set-DnsClientServerAddress` may fail without elevation
 
 Do not promise full parity across platforms unless the implementation actually has it.
+
+## Browser Leak Detection
+
+The `browser-leaks` subcommand currently runs **Python-level checks only** (timezone, locale, language, connection). The WebRTC / JavaScript / Canvas / font fingerprint analysis logic exists in `browser_leaks.py` but is NOT automatically invoked by the CLI — it requires a browser automation layer (Playwright/Selenium) that is not bundled. Describe this capability as "browser leak detection framework" rather than "full automated browser detection".
 
 ## Architecture
 
