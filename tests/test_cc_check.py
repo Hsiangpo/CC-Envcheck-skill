@@ -606,6 +606,7 @@ class TestClashVergeDnsToggleSafety(unittest.TestCase):
 
     @patch.object(cc_check.plat, "PLATFORM", "win32")
     def test_allow_dns_toggle_when_runtime_uses_ip_proxies(self):
+        """ensure_verge_dns_toggle is now a no-op — never modifies verge.yaml."""
         with tempfile.TemporaryDirectory() as tmpdir:
             clash_dir = Path(tmpdir)
             (clash_dir / "verge.yaml").write_text("enable_dns_settings: true\n", encoding="utf-8")
@@ -616,8 +617,9 @@ class TestClashVergeDnsToggleSafety(unittest.TestCase):
 
             changed = cc_check.ensure_verge_dns_toggle(clash_dir)
 
-            self.assertTrue(changed)
-            self.assertIn("enable_dns_settings: false", (clash_dir / "verge.yaml").read_text(encoding="utf-8"))
+            self.assertFalse(changed)
+            # Verify verge.yaml was NOT modified
+            self.assertIn("enable_dns_settings: true", (clash_dir / "verge.yaml").read_text(encoding="utf-8"))
 
 
 class TestFixLocalRiskGates(unittest.TestCase):

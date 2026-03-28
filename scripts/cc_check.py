@@ -902,25 +902,17 @@ def runtime_has_domain_proxies(runtime_text: str) -> bool:
 
 
 def ensure_verge_dns_toggle(clash_dir: Path) -> bool:
-    """在安全前提下关闭 Clash Verge 的 DNS 设置开关。"""
+    """检查 Clash Verge DNS 设置状态（不再修改）。
+
+    之前的实现会强制设置 enable_dns_settings: false，但这会导致
+    订阅自带的中国 DNS (223.5.5.5/114.114.114.114) 无法被 Global Merge
+    覆盖，进而破坏 fake-ip 模式下的节点切换。现在只做检查不做修改。
+    """
     verge_yaml = clash_dir / "verge.yaml"
     if not verge_yaml.exists():
         return False
-
-    runtime = clash_dir / "clash-verge.yaml"
-    runtime_text = runtime.read_text(encoding="utf-8", errors="ignore") if runtime.exists() else ""
-
-    # macOS 上如果运行时代理节点使用域名，强关 DNS 设置可能打断代理链路。
-    if plat.PLATFORM == "darwin" and runtime_has_domain_proxies(runtime_text):
-        return False
-
-    text = verge_yaml.read_text(encoding="utf-8", errors="ignore")
-    if "enable_dns_settings:" in text:
-        text = re.sub(r"enable_dns_settings:\s*.*", "enable_dns_settings: false", text)
-    else:
-        text += "\nenable_dns_settings: false\n"
-    verge_yaml.write_text(text, encoding="utf-8")
-    return True
+    # 不再修改 enable_dns_settings，避免破坏节点切换
+    return False
 
 
 def redact_text(text: str, tokens: list[str]) -> str:
