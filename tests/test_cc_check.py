@@ -879,6 +879,17 @@ class TestBrowserLeaksReporting(unittest.TestCase):
         self.assertEqual(finding.key, "browser-python-egress-alignment")
         self.assertEqual(finding.status, "fail")
 
+    def test_analyze_webrtc_ignores_zero_ip_placeholder(self):
+        findings = bleaks.analyze_webrtc({
+            "supported": True,
+            "localCandidates": [],
+            "publicCandidates": ["104.254.211.203", "0.0.0.0"],
+        })
+
+        self.assertEqual(findings[0].status, "fail")
+        self.assertNotIn("0.0.0.0", findings[0].summary)
+        self.assertNotIn("0.0.0.0", findings[0].details)
+
     @patch.object(bleaks, "run_python_checks")
     @patch.object(bleaks, "detect_playwright_automation")
     def test_run_browser_checks_falls_back_when_playwright_unavailable(self, mock_detect, mock_python):

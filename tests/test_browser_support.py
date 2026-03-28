@@ -56,6 +56,29 @@ class TestBrowserScoring(unittest.TestCase):
         self.assertIsNotNone(payload["browser_score"])
         self.assertEqual(payload["browser_score"]["max_score"], 28)
 
+    def test_build_browser_recommendations_from_findings(self):
+        findings = [
+            bleaks.BrowserFinding("webrtc", "webrtc-leak", "fail", "bad"),
+            bleaks.BrowserFinding("fonts", "china-fonts", "warn", "fonts"),
+            bleaks.BrowserFinding("ip", "browser-python-egress-alignment", "fail", "mismatch"),
+        ]
+
+        recommendations = bleaks.build_browser_recommendations(findings, {
+            "automation_used": True,
+            "reason": "",
+        })
+
+        keys = [item["key"] for item in recommendations]
+        self.assertEqual(keys, ["webrtc-leak", "browser-python-egress-alignment", "china-fonts"])
+
+    def test_build_browser_recommendations_bootstrap_hint_when_automation_unavailable(self):
+        recommendations = bleaks.build_browser_recommendations([], {
+            "automation_used": False,
+            "reason": "playwright package not found in current Node environment; run browser_bootstrap.py install to prepare local Playwright",
+        })
+
+        self.assertEqual(recommendations[0]["key"], "automation-bootstrap")
+
 
 class TestBrowserBootstrapStatus(unittest.TestCase):
     """验证本地 Playwright 引导状态输出。"""

@@ -277,7 +277,10 @@ def analyze_webrtc(data: dict) -> list[BrowserFinding]:
 
         error = str(data.get("error", "")).strip()
         local_candidates = data.get("localCandidates", []) or []
-        public_candidates = data.get("publicCandidates", []) or []
+        public_candidates = [
+            candidate for candidate in (data.get("publicCandidates", []) or [])
+            if str(candidate).strip() not in {"", "0.0.0.0", "::", "::0"}
+        ]
         if error:
             findings.append(BrowserFinding("webrtc", "webrtc-leak", "warn", f"WebRTC collection error: {error}"))
         elif public_candidates:
@@ -601,6 +604,59 @@ def _manual_checklist(executed_tests: list[str] | None = None) -> list[dict[str,
     ]
 
 
+def build_browser_recommendations(findings: list[BrowserFinding], report_meta: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    """根据浏览器 findings 生成可执行建议。"""
+    report_meta = report_meta or {}
+    recommendations: list[dict[str, str]] = []
+
+    if not report_meta.get("automation_used") and "browser_bootstrap.py install" in str(report_meta.get("reason", "")):
+        recommendations.append({
+            "key": "automation-bootstrap",
+            "priority": "high",
+            "message": "运行 browser_bootstrap.py install，先把本地 Playwright 环境装好，再重新执行 browser-leaks。",
+        })
+
+    rules = {
+        "webrtc-leak": ("high", "收紧 WebRTC 暴露，优先使用禁用非代理 UDP/WebRTC 泄露的浏览器策略后再复测。"),
+        "browser-python-egress-alignment": ("high", "浏览器出口和 Python 基线不一致，优先排查浏览器是否绕过代理或使用了不同网络栈。"),
+        "china-fonts": ("medium", "浏览器暴露了中文字体，建议使用更隔离的自动化浏览器环境或独立用户目录。"),
+        "webgl-renderer": ("medium", "WebGL 呈现看起来像软件渲染，建议检查浏览器是否落到了 SwiftShader/llvmpipe。"),
+        "tls-browser-version": ("medium", "浏览器 TLS 页面没有明确确认 TLS 1.3，建议手工复核 TLS 页面并检查浏览器版本。"),
+        "js-locale": ("medium", "浏览器 locale 仍需和目标环境一致，建议复查浏览器语言首选项。"),
+        "js-timezone": ("medium", "浏览器 timezone 仍需和目标环境一致，建议复查系统和浏览器时区设置。"),
+    }
+
+    seen: set[str] = set()
+    for finding in findings:
+        if finding.key in seen:
+            continue
+        if finding.status not in {"fail", "warn"}:
+            continue
+        rule = rules.get(finding.key)
+        if not rule:
+            continue
+        priority, message = rule
+        recommendations.append({
+            "key": finding.key,
+            "priority": priority,
+            "message": message,
+        })
+        seen.add(finding.key)
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    key_order = {
+        "webrtc-leak": 0,
+        "browser-python-egress-alignment": 1,
+        "china-fonts": 2,
+        "webgl-renderer": 3,
+        "tls-browser-version": 4,
+        "js-locale": 5,
+        "js-timezone": 6,
+        "automation-bootstrap": 7,
+    }
+    recommendations.sort(key=lambda item: (priority_order.get(item["priority"], 9), key_order.get(item["key"], 99), item["key"]))
+    return recommendations
+
+
 def detect_playwright_automation() -> dict[str, Any]:
     """探测是否可使用 Playwright 自动化浏览器检测。"""
     return detect_playwright_support(SCRIPT_DIR)
@@ -703,6 +759,7 @@ def build_report_payload(findings: list[BrowserFinding], report_meta: dict[str, 
         "browser_score": report_meta["browser_score"],
         "automated": automated,
         "manual": _manual_checklist(report_meta["executed_tests"]),
+        "recommendations": build_browser_recommendations(findings, report_meta),
     }
 
 
@@ -737,6 +794,7 @@ def print_browser_report(findings: list[BrowserFinding], report_meta: dict[str, 
         print(f"  ℹ️  Automation unavailable: {report_meta['reason']}")
 
     manual_items = _manual_checklist(report_meta["executed_tests"])
+    recommendations = build_browser_recommendations(findings, report_meta)
     if manual_items:
         print("\n" + "-" * 50)
         print("  📋 Browser-only tests (requires manual check or extra browser tooling):")
@@ -748,6 +806,11 @@ def print_browser_report(findings: list[BrowserFinding], report_meta: dict[str, 
             print(f"     检查: {t['pass_criteria']}")
             print()
         print("  💡 Remaining manual checks focus on tests that are not yet automated.")
+    if recommendations:
+        print("\n" + "-" * 50)
+        print("  🛠 Recommendations:")
+        for item in recommendations:
+            print(f"  [{item['priority']}] {item['message']}")
     print()
 
 
