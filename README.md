@@ -93,6 +93,9 @@ python scripts/cc_check.py browser-leaks --json
 # 强制关闭自动化，仅输出 Python 基线 + 手工清单
 python scripts/cc_check.py browser-leaks --automation off
 
+# 检测已经打开并暴露 CDP 的真实浏览器/指纹浏览器（例如 9222）
+python scripts/cc_check.py browser-leaks --browser-cdp-url http://127.0.0.1:9222
+
 # 准备本地 Playwright 环境（可选）
 python scripts/browser_bootstrap.py status
 python scripts/browser_bootstrap.py install --dry-run
@@ -102,6 +105,7 @@ python scripts/browser_bootstrap.py install --dry-run
 # 自动化成功时，browser-leaks JSON 还会带 artifact_path，指向本次证据文件
 # VPN 检查现在是显式启用：需要时传 --vpn-root
 # 国家策略已扩展到更多国家，包含尼日利亚、南非、阿联酋、巴西等常见节点地区
+# 如果要检测真实用户浏览器，而不是 Playwright 基线浏览器，请先打开该浏览器并暴露 CDP 端口（常见是 9222）
 
 # 自定义目标参数
 python scripts/cc_check.py inspect \
@@ -389,7 +393,7 @@ cc-check/
 ## 🧪 测试
 
 ```bash
-# 运行全部 88 个单元测试
+# 运行全部 89 个单元测试
 python -m unittest discover -s tests -v
 
 # CI: macOS + Linux + Windows × Python 3.10/3.11/3.12 = 9 矩阵

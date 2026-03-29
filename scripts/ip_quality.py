@@ -45,6 +45,39 @@ def run_whois(ip: str) -> str:
         return ""
 
 
+def query_team_cymru(ip: str) -> dict[str, str] | None:
+    """查询 Team Cymru 的 IP -> ASN 映射。"""
+    payload = f"begin\nverbose\n{ip}\nend\n".encode("utf-8")
+    try:
+        with socket.create_connection(("whois.cymru.com", 43), timeout=10) as conn:
+            conn.sendall(payload)
+            chunks: list[bytes] = []
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+    except OSError:
+        return None
+
+    text = b"".join(chunks).decode("utf-8", errors="ignore")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    parts = [item.strip() for item in lines[-1].split("|")]
+    if len(parts) < 7:
+        return None
+    return {
+        "asn": parts[0],
+        "ip": parts[1],
+        "prefix": parts[2],
+        "cc": parts[3],
+        "registry": parts[4],
+        "allocated": parts[5],
+        "as_name": parts[6],
+    }
+
+
 def parse_whois_country(text: str) -> str | None:
     for line in text.splitlines():
         if line.lower().startswith("country:"):
@@ -76,17 +109,25 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
     def _fetch_bgpview() -> dict | None:
         return fetch_json(f"https://api.bgpview.io/ip/{ip}")
 
+    def _fetch_ipapi_is() -> dict | None:
+        return fetch_json(f"https://api.ipapi.is/?q={ip}")
+
     def _fetch_whois() -> str:
         return run_whois(ip)
 
+    def _fetch_team_cymru() -> dict[str, str] | None:
+        return query_team_cymru(ip)
+
     results: dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=7) as pool:
         futures = {
             pool.submit(_fetch_ipinfo): "ipinfo",
             pool.submit(_fetch_ip_api): "ip_api",
             pool.submit(_fetch_proxycheck): "proxycheck",
             pool.submit(_fetch_bgpview): "bgpview",
+            pool.submit(_fetch_ipapi_is): "ipapi_is",
             pool.submit(_fetch_whois): "whois",
+            pool.submit(_fetch_team_cymru): "team_cymru",
         }
         for future in as_completed(futures):
             name = futures[future]
@@ -99,8 +140,10 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
     ip_api = results.get("ip_api")
     proxycheck = results.get("proxycheck")
     bgpview = results.get("bgpview")
+    ipapi_is = results.get("ipapi_is")
     whois_text = results.get("whois", "")
     whois_country = parse_whois_country(whois_text) if whois_text else None
+    team_cymru = results.get("team_cymru")
 
     proxy_data = None
     if proxycheck and proxycheck.get("status") == "ok":
@@ -124,6 +167,15 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
         country_code = country_code or ip_api.get("countryCode")
         city = city or ip_api.get("city")
         isp_name = isp_name or ip_api.get("isp", "")
+    if isinstance(ipapi_is, dict):
+        location = ipapi_is.get("location", {})
+        company = ipapi_is.get("company", {})
+        asn = ipapi_is.get("asn", {})
+        timezone = timezone or location.get("timezone")
+        country_code = country_code or location.get("country_code")
+        country = country or location.get("country")
+        city = city or location.get("city")
+        isp_name = isp_name or company.get("name") or asn.get("org")
 
     # Derive locale from country
     profile = resolve_country_profile(country_code)
@@ -159,6 +211,15 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
     else:
         details.append("proxycheck: unavailable")
 
+    if isinstance(ipapi_is, dict):
+        details.append(
+            "ipapi.is: "
+            f"vpn={ipapi_is.get('is_vpn', '?')} proxy={ipapi_is.get('is_proxy', '?')} "
+            f"datacenter={ipapi_is.get('is_datacenter', '?')} tor={ipapi_is.get('is_tor', '?')}"
+        )
+    else:
+        details.append("ipapi.is: unavailable")
+
     if isinstance(bgpview, dict) and bgpview.get("status") == "ok":
         data = bgpview.get("data", {})
         rir = data.get("rir_allocation", {})
@@ -169,6 +230,14 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
     else:
         details.append("bgpview: unavailable")
 
+    if isinstance(team_cymru, dict):
+        details.append(
+            f"team-cymru: asn={team_cymru.get('asn', '?')} prefix={team_cymru.get('prefix', '?')} "
+            f"cc={team_cymru.get('cc', '?')} registry={team_cymru.get('registry', '?')}"
+        )
+    else:
+        details.append("team-cymru: unavailable")
+
     details.append(f"whois: country={whois_country or '?'}")
 
     # Classify — sub-finding granularity
@@ -177,9 +246,13 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
     risk_score = int(proxy_data.get("risk", 0)) if isinstance(proxy_data, dict) else 0
     hosting = bool(ip_api.get("hosting")) if isinstance(ip_api, dict) and ip_api.get("status") == "success" else False
     api_proxy = bool(ip_api.get("proxy")) if isinstance(ip_api, dict) and ip_api.get("status") == "success" else False
+    ipapi_proxy = bool(ipapi_is.get("is_proxy")) if isinstance(ipapi_is, dict) else False
+    ipapi_vpn = bool(ipapi_is.get("is_vpn")) if isinstance(ipapi_is, dict) else False
+    ipapi_hosting = bool(ipapi_is.get("is_datacenter")) if isinstance(ipapi_is, dict) else False
+    ipapi_tor = bool(ipapi_is.get("is_tor")) if isinstance(ipapi_is, dict) else False
 
     # Sub-finding 1: ip-not-proxy
-    if proxy_flag or api_proxy:
+    if proxy_flag or api_proxy or ipapi_proxy or ipapi_vpn or ipapi_tor:
         proxy_status = "fail"
         proxy_summary = f"IP is flagged as proxy/VPN (type={ip_type}, risk={risk_score})"
     else:
@@ -187,7 +260,7 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
         proxy_summary = "IP not flagged as proxy/VPN"
 
     # Sub-finding 2: ip-not-hosting
-    if hosting:
+    if hosting or ipapi_hosting:
         hosting_status = "fail"
         hosting_summary = "IP is flagged as hosting/IDC"
     else:
@@ -232,7 +305,7 @@ def assess_ip_quality(ip: str, expected_ip_type: str = "residential") -> dict[st
         geo_summary = "Geo/whois country consistent"
 
     # ISP info (informational, appended to details)
-    if isp_name and expected_ip_type == "residential":
+    if isp_name and expected_ip_type == "residential" and country_code == "US":
         isp_lower = isp_name.lower()
         is_known_resi = any(resi in isp_lower for resi in US_RESIDENTIAL_ISPS)
         if not is_known_resi:

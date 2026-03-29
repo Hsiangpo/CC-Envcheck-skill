@@ -104,6 +104,9 @@ python3 <path>/scripts/cc_check.py browser-leaks --json
 # Disable browser automation and keep manual checklist only
 python3 <path>/scripts/cc_check.py browser-leaks --automation off
 
+# Attach to a real browser or fingerprint browser that already exposes CDP
+python3 <path>/scripts/cc_check.py browser-leaks --browser-cdp-url http://127.0.0.1:9222
+
 # Prepare optional local Playwright environment
 python3 <path>/scripts/browser_bootstrap.py status
 python3 <path>/scripts/browser_bootstrap.py install --dry-run
@@ -112,6 +115,7 @@ python3 <path>/scripts/browser_bootstrap.py install --dry-run
 # browser_bootstrap status includes tools/proxy_env/install_commands/recommendations
 # automation success also emits artifact_path for the saved evidence file
 # country profiles now cover more regions, including Nigeria and other non-US targets
+# to inspect the user's real browser instead of a fresh Playwright baseline, ask them to open the browser/profile with CDP enabled first
 
 # With overrides
 python3 <path>/scripts/cc_check.py inspect \
@@ -228,7 +232,7 @@ Do not promise full parity across platforms unless the implementation actually h
 
 ## Browser Leak Detection
 
-The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can collect browser-side WebRTC / JavaScript runtime / browser egress IP / font / Canvas / WebGL / TLS page signals, compare browser egress with the Python baseline egress, emit a dedicated `browser_score` summary, and save a JSON evidence artifact whose path is returned as `artifact_path`. TLS version detection now prefers real browser security details over page text when available. Tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing and the bootstrap helper reports local install commands plus proxy/tool diagnostics.
+The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can either launch a fresh baseline browser or attach to a real Chromium-compatible browser / fingerprint browser via CDP (`--browser-cdp-url`, common example: `http://127.0.0.1:9222`). It collects browser-side WebRTC / JavaScript runtime / browser egress IP / font / Canvas / WebGL / TLS page signals, compares browser egress with the Python baseline egress, emits a dedicated `browser_score` summary, and saves a JSON evidence artifact whose path is returned as `artifact_path`. TLS version detection now prefers real browser security details over page text when available. Tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing and the bootstrap helper reports local install commands plus proxy/tool diagnostics.
 
 ## Architecture
 

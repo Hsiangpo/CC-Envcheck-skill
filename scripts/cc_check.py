@@ -1217,6 +1217,10 @@ def main() -> int:
         default="auto",
         help="Whether to auto-run optional Playwright browser checks",
     )
+    bl_sp.add_argument(
+        "--browser-cdp-url",
+        help="Attach to an already-running Chromium-compatible browser via CDP (for example http://127.0.0.1:9222)",
+    )
 
     dns_sp = sub.add_parser("fix-system-dns-display")
     dns_sp.add_argument("--quiet", action="store_true")
@@ -1231,7 +1235,10 @@ def main() -> int:
             return 0
 
         if args.command == "browser-leaks":
-            findings, report_meta = bleaks.run_browser_checks(getattr(args, "automation", "auto"))
+            findings, report_meta = bleaks.run_browser_checks(
+                getattr(args, "automation", "auto"),
+                browser_cdp_url=getattr(args, "browser_cdp_url", None),
+            )
             if getattr(args, "json", False):
                 print(json.dumps(bleaks.build_report_payload(findings, report_meta), ensure_ascii=False, indent=2))
             else:

@@ -165,6 +165,42 @@ async function launchBrowser(chromium) {
   throw lastError || new Error('Unable to launch browser');
 }
 
+async function acquireBrowserSession(chromium) {
+  const cdpUrl = process.env.CC_CHECK_BROWSER_CDP_URL || '';
+  if (cdpUrl) {
+    const browser = await chromium.connectOverCDP(cdpUrl);
+    const context = browser.contexts()[0];
+    if (!context) {
+      throw new Error(`Connected to ${cdpUrl} but no browser context is available`);
+    }
+    const page = await context.newPage();
+    return {
+      browser,
+      context,
+      page,
+      provider: 'cdp',
+      close: async () => {
+        await page.close();
+        await browser.close();
+      },
+    };
+  }
+
+  const browser = await launchBrowser(chromium);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  return {
+    browser,
+    context,
+    page,
+    provider: 'playwright',
+    close: async () => {
+      await context.close();
+      await browser.close();
+    },
+  };
+}
+
 async function collectCanvas(page) {
   await page.goto('about:blank', { waitUntil: 'domcontentloaded' });
   const payload = await page.evaluate(() => {
@@ -241,9 +277,8 @@ async function main() {
     throw new Error(`Unable to load chromium from ${playwrightSpecifier}`);
   }
 
-  const browser = await launchBrowser(chromium);
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  const session = await acquireBrowserSession(chromium);
+  const { page } = session;
   const results = {};
   const executedTests = [];
   const errors = [];
@@ -267,10 +302,9 @@ async function main() {
     }
   }
 
-  await context.close();
-  await browser.close();
+  await session.close();
 
-  process.stdout.write(JSON.stringify({ ok: true, provider: 'playwright', executedTests, results, errors }));
+  process.stdout.write(JSON.stringify({ ok: true, provider: session.provider, executedTests, results, errors }));
 }
 
 main().catch((error) => {

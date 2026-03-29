@@ -10,6 +10,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import urlopen
 
 
 LOCAL_BROWSER_ENV = ".cc-check-browser"
@@ -53,7 +55,36 @@ def _normalize_reason(reason: str) -> str:
     return reason.strip() or "playwright unavailable"
 
 
-def detect_playwright_support(scripts_dir: Path) -> dict[str, Any]:
+def _detect_cdp_endpoint(explicit: str | None = None) -> str | None:
+    """探测现有浏览器的 CDP 入口。"""
+    candidates = []
+    if explicit:
+        candidates.append(explicit.strip())
+    env_candidate = os.environ.get("CC_CHECK_BROWSER_CDP_URL", "").strip()
+    if env_candidate and env_candidate not in candidates:
+        candidates.append(env_candidate)
+    if "http://127.0.0.1:9222" not in candidates:
+        candidates.append("http://127.0.0.1:9222")
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if candidate.startswith(("ws://", "wss://")):
+            return candidate
+        probe = candidate.rstrip("/")
+        if not probe.endswith("/json/version"):
+            probe = f"{probe}/json/version"
+        try:
+            with urlopen(probe, timeout=2) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+            continue
+        if payload.get("webSocketDebuggerUrl"):
+            return candidate.rstrip("/")
+    return None
+
+
+def detect_playwright_support(scripts_dir: Path, browser_cdp_url: str | None = None) -> dict[str, Any]:
     """检测当前环境是否具备 Playwright 自动化能力。"""
     node_path = shutil.which("node")
     runner_path = scripts_dir / "browser_automation_runner.mjs"
@@ -73,31 +104,34 @@ def detect_playwright_support(scripts_dir: Path) -> dict[str, Any]:
             "reason": "runner script missing",
             "runner": str(runner_path),
         }
-    if module_specifier:
+    if not module_specifier:
+        completed = subprocess.run(
+            [node_path, "-e", _probe_playwright_command()],
+            cwd=str(scripts_dir.parent),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if completed.returncode != 0:
+            reason = _normalize_reason(completed.stderr or completed.stdout or "playwright package not found")
+            return {
+                "available": False,
+                "provider": "playwright",
+                "reason": f"{reason}; {bootstrap_hint}",
+                "runner": str(runner_path),
+            }
+        module_specifier = "playwright"
+    cdp_url = _detect_cdp_endpoint(browser_cdp_url)
+    if cdp_url:
         return {
             "available": True,
-            "provider": "playwright",
+            "provider": "cdp",
             "reason": "",
             "runner": str(runner_path),
             "node": node_path,
-            "module_specifier": module_specifier,
-        }
-
-    completed = subprocess.run(
-        [node_path, "-e", _probe_playwright_command()],
-        cwd=str(scripts_dir.parent),
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    if completed.returncode != 0:
-        reason = _normalize_reason(completed.stderr or completed.stdout or "playwright package not found")
-        return {
-            "available": False,
-            "provider": "playwright",
-            "reason": f"{reason}; {bootstrap_hint}",
-            "runner": str(runner_path),
+            "module_specifier": module_specifier or "playwright",
+            "cdp_url": cdp_url,
         }
     return {
         "available": True,
@@ -105,13 +139,13 @@ def detect_playwright_support(scripts_dir: Path) -> dict[str, Any]:
         "reason": "",
         "runner": str(runner_path),
         "node": node_path,
-        "module_specifier": "playwright",
+        "module_specifier": module_specifier or "playwright",
     }
 
 
-def execute_playwright_runner(scripts_dir: Path, timeout: int = 120) -> dict[str, Any]:
+def execute_playwright_runner(scripts_dir: Path, timeout: int = 120, browser_cdp_url: str | None = None) -> dict[str, Any]:
     """执行 Playwright runner 并返回原始 JSON 结果。"""
-    capability = detect_playwright_support(scripts_dir)
+    capability = detect_playwright_support(scripts_dir, browser_cdp_url=browser_cdp_url)
     if not capability.get("available"):
         return {
             "ok": False,
@@ -132,6 +166,7 @@ def execute_playwright_runner(scripts_dir: Path, timeout: int = 120) -> dict[str
         env={
             **os.environ,
             "CC_CHECK_PLAYWRIGHT_MODULE": capability.get("module_specifier", "playwright"),
+            "CC_CHECK_BROWSER_CDP_URL": capability.get("cdp_url", ""),
         },
     )
     if completed.returncode != 0:

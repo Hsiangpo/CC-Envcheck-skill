@@ -724,14 +724,14 @@ def refine_webrtc_findings(
     return refined
 
 
-def detect_playwright_automation() -> dict[str, Any]:
+def detect_playwright_automation(browser_cdp_url: str | None = None) -> dict[str, Any]:
     """探测是否可使用 Playwright 自动化浏览器检测。"""
-    return detect_playwright_support(SCRIPT_DIR)
+    return detect_playwright_support(SCRIPT_DIR, browser_cdp_url=browser_cdp_url)
 
 
-def run_playwright_automation() -> dict[str, Any]:
+def run_playwright_automation(browser_cdp_url: str | None = None) -> dict[str, Any]:
     """执行 Playwright 自动化并将原始结果转换为浏览器发现项。"""
-    payload = execute_playwright_runner(SCRIPT_DIR)
+    payload = execute_playwright_runner(SCRIPT_DIR, browser_cdp_url=browser_cdp_url)
     findings: list[BrowserFinding] = []
     executed_tests = list(payload.get("executed_tests", []))
     results = payload.get("results", {})
@@ -763,7 +763,7 @@ def run_playwright_automation() -> dict[str, Any]:
     }
 
 
-def run_browser_checks(automation: str = "auto") -> tuple[list[BrowserFinding], dict[str, Any]]:
+def run_browser_checks(automation: str = "auto", browser_cdp_url: str | None = None) -> tuple[list[BrowserFinding], dict[str, Any]]:
     """运行浏览器检测并在可用时自动接入 Playwright。"""
     findings = run_python_checks()
     meta = _default_report_meta()
@@ -771,14 +771,14 @@ def run_browser_checks(automation: str = "auto") -> tuple[list[BrowserFinding], 
         meta["reason"] = "automation disabled"
         return findings, meta
 
-    capability = detect_playwright_automation()
+    capability = detect_playwright_automation(browser_cdp_url=browser_cdp_url)
     meta["provider"] = capability.get("provider", "playwright")
     meta["automation_supported"] = bool(capability.get("available"))
     meta["reason"] = capability.get("reason", "")
     if not capability.get("available"):
         return findings, meta
 
-    automation_result = run_playwright_automation()
+    automation_result = run_playwright_automation(browser_cdp_url=browser_cdp_url)
     meta["errors"] = automation_result.get("errors", [])
     executed_tests = automation_result.get("executed_tests", [])
     if not executed_tests:

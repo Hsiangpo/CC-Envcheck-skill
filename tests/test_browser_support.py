@@ -18,6 +18,7 @@ import browser_bootstrap as bboot
 import browser_artifacts as barts
 import browser_leaks as bleaks
 import browser_scoring as bscore
+import browser_automation as bauto
 
 
 class TestBrowserScoring(unittest.TestCase):
@@ -172,6 +173,24 @@ class TestBrowserBootstrapStatus(unittest.TestCase):
 
         self.assertEqual(payload["proxy_env"]["HTTPS_PROXY"], "http://127.0.0.1:7897")
         self.assertEqual(len(payload["install_commands"]), 2)
+
+
+class TestBrowserAutomationDetection(unittest.TestCase):
+    """验证浏览器自动化目标选择。"""
+
+    @patch("browser_automation.resolve_playwright_module_specifier", return_value="file:///tmp/playwright/index.js")
+    @patch("browser_automation._detect_cdp_endpoint", return_value="http://127.0.0.1:9222")
+    @patch("browser_automation.shutil.which", return_value="/usr/local/bin/node")
+    def test_detect_playwright_support_prefers_cdp_when_available(self, *_: object):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scripts_dir = Path(tmpdir) / "scripts"
+            scripts_dir.mkdir()
+            (scripts_dir / "browser_automation_runner.mjs").write_text("// runner\n", encoding="utf-8")
+            capability = bauto.detect_playwright_support(scripts_dir, browser_cdp_url="http://127.0.0.1:9222")
+
+        self.assertTrue(capability["available"])
+        self.assertEqual(capability["provider"], "cdp")
+        self.assertEqual(capability["cdp_url"], "http://127.0.0.1:9222")
 
 
 class TestBrowserArtifacts(unittest.TestCase):
