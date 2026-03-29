@@ -8,7 +8,7 @@
 
 **50+ 自动化检测 · 100 分制评分 · 分级修复 · 跨平台支持**
 
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0a0a0a?style=flat-square&logo=apple&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![Python](https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/) [![Tests](https://img.shields.io/badge/tests-63%20passed-00C853?style=flat-square&logo=pytest&logoColor=white)](https://github.com/Hsiangpo/CC-check/actions) [![Version](https://img.shields.io/badge/version-1.3.0-FF6F00?style=flat-square&logo=semver&logoColor=white)](https://github.com/Hsiangpo/CC-check) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-0a0a0a?style=flat-square&logo=apple&logoColor=white)](https://github.com/Hsiangpo/CC-Envcheck-skill) [![Python](https://img.shields.io/badge/python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/) [![Tests](https://img.shields.io/badge/tests-89%20passed-00C853?style=flat-square&logo=pytest&logoColor=white)](https://github.com/Hsiangpo/CC-Envcheck-skill/actions) [![Version](https://img.shields.io/badge/version-1.3.0-FF6F00?style=flat-square&logo=semver&logoColor=white)](https://github.com/Hsiangpo/CC-Envcheck-skill) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 <br>
 
@@ -184,9 +184,9 @@ python scripts/cc_check.py inspect \
 
 ---
 
-## 🎯 IP 纯净度 — 五渠道交叉验证
+## 🎯 IP 纯净度 — 多层交叉验证
 
-> 占总分 **30%**，权重最高。单一渠道容易被绕过，五渠道交叉几乎无法伪造。
+> 占总分 **30%**，权重最高。单一渠道容易被绕过，多层信号交叉更稳：Geo/ASN、风控情报、RIR/ASN 注册信息、whois 国家校验。
 
 ```
                   +----------+
@@ -200,14 +200,14 @@ python scripts/cc_check.py inspect \
      | Geo+ASN  | |Type+ISP| | Risk+VPN  |
      +----+-----+ +---+----+ +-----+-----+
           |            |            |
-          +------+-----+-----+-----+
+          +------+-----+-----+-----+----------------+
                  |           |
-          +------+---+ +----+-----+
-          | bgpview  | |  whois   |
-          | BGP/RIR  | | Country  |
-          +------+---+ +----+-----+
-                 |           |
-                 +-----+-----+
+          +------+---+ +----+-----+ +-------+------+
+          |Team Cymru| |  whois   | | ipapi.is    |
+          | ASN/BGP  | | Country  | | proxy/DC    |
+          +------+---+ +----+-----+ +-------+------+
+                 |           |              |
+                 +-----+-----+------+-------+
                        |
               +--------+--------+
               |   Classification |

@@ -347,10 +347,11 @@ class TestBrowserLeaksReporting(unittest.TestCase):
         self.assertEqual(meta["provider"], "playwright")
         self.assertEqual(meta["executed_tests"], [])
 
+    @patch.object(bleaks, "save_browser_artifact", return_value="/tmp/browser-artifact.json")
     @patch.object(bleaks, "run_playwright_automation")
     @patch.object(bleaks, "run_python_checks")
     @patch.object(bleaks, "detect_playwright_automation")
-    def test_run_browser_checks_uses_playwright_when_available(self, mock_detect, mock_python, mock_playwright):
+    def test_run_browser_checks_uses_playwright_when_available(self, mock_detect, mock_python, mock_playwright, _mock_artifact):
         mock_detect.return_value = {
             "available": True,
             "provider": "playwright",

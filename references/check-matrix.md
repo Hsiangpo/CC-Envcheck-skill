@@ -6,7 +6,7 @@
 
 | Key | Check | Weight | Method |
 |-----|-------|--------|--------|
-| classification | IP type/risk/ISP check | 30 | 5 channels: ipinfo, ip-api, proxycheck, bgpview, whois |
+| classification | IP type/risk/ISP check | 30 | Multi-source: ipinfo, ip-api, proxycheck, ipapi.is, Team Cymru, whois |
 
 Criteria for pass:
 - Not flagged as proxy/VPN/hosting by any source

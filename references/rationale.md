@@ -120,8 +120,9 @@ DNS in `warn` state (TUN active + suspicious display DNS) is still worth cleanin
 1. **ipinfo.io**: Geo + ASN + org (most reliable geo)
 2. **ip-api.com**: proxy/hosting/mobile flags (most reliable type)
 3. **proxycheck.io**: VPN detection + risk score (most granular)
-4. **bgpview.io**: BGP prefix analysis (ASN validation)
-5. **whois**: Country cross-check (independent verification)
+4. **ipapi.is**: datacenter / proxy / vpn / tor heuristics
+5. **Team Cymru**: IP to ASN / prefix / registry mapping
+6. **whois**: Country cross-check (independent verification)
 
 ### Residential ISP Whitelist
 US residential ISPs that should pass cleanly: Comcast/Xfinity, AT&T, Verizon, Spectrum, Cox, CenturyLink, Frontier, Mediacom, etc.
