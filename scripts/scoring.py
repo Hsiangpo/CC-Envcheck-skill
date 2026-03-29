@@ -121,6 +121,16 @@ def _get_weight(group: str, key: str) -> int:
     return WEIGHTS.get(group, {}).get(key, 0)
 
 
+def has_scored_failures(findings: list[Any]) -> bool:
+    """仅当计分项出现 fail 时返回 True。"""
+    return any(_get_weight(f.group, f.key) > 0 and f.status == "fail" for f in findings)
+
+
+def count_scored_failures(findings: list[Any]) -> int:
+    """统计计分项中的 fail 数量。"""
+    return sum(1 for f in findings if _get_weight(f.group, f.key) > 0 and f.status == "fail")
+
+
 def compute_score(findings: list[Any]) -> ScoreReport:
     """根据 findings 计算评分。"""
     group_earned: dict[str, float] = {}

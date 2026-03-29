@@ -27,7 +27,7 @@ from urllib.request import urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ip_quality import assess_ip_quality
-from scoring import compute_score, format_score_report
+from scoring import compute_score, count_scored_failures, format_score_report, has_scored_failures
 import platform_ops as plat
 import vpn_adapter as vpnops
 import browser_leaks as bleaks
@@ -1170,7 +1170,7 @@ def main() -> int:
     command_parsers: dict[str, argparse.ArgumentParser] = {}
     for name in ("inspect", "fix-local", "fix-vpn", "verify", "full"):
         sp = sub.add_parser(name)
-        sp.add_argument("--vpn-root", help="Override VPN project root")
+        sp.add_argument("--vpn-root", help="Explicit VPN project root for optional VPN checks")
         sp.add_argument("--clash-dir", help="Override Clash Verge directory")
         sp.add_argument("--public-subscription-url", help="Override subscription URL")
         sp.add_argument("--target-timezone", help="Expected timezone (Olson)")
@@ -1227,7 +1227,7 @@ def main() -> int:
                 print(json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2))
             else:
                 print_report(findings)
-            return 0 if not any(f.status == "fail" for f in findings) else 2
+            return 0 if not has_scored_failures(findings) else 2
 
         if args.command == "fix-local":
             for a in fix_local(ctx):
@@ -1236,7 +1236,7 @@ def main() -> int:
                 print(_c(_C.BOLD, "\n=== Auto-Verify ==="))
                 verify_findings = collect_findings(ctx, include_vpn=False)
                 print_report(verify_findings)
-                return 0 if not any(f.status == "fail" for f in verify_findings) else 2
+                return 0 if not has_scored_failures(verify_findings) else 2
             return 0
 
         if args.command == "fix-vpn":
@@ -1250,12 +1250,12 @@ def main() -> int:
                 print(json.dumps([f.to_dict() for f in findings], ensure_ascii=False, indent=2))
             else:
                 print_report(findings)
-            return 0 if not any(f.status == "fail" for f in findings) else 2
+            return 0 if not has_scored_failures(findings) else 2
 
         if args.command == "full":
             print("=== Phase 1: Inspect ===")
             initial = collect_findings(ctx)
-            fail_count = sum(1 for f in initial if f.status == "fail")
+            fail_count = count_scored_failures(initial)
             if fail_count == 0:
                 print_report(initial)
                 return 0
@@ -1274,7 +1274,7 @@ def main() -> int:
             print("\n=== Phase 3: Verify ===")
             final = collect_findings(ctx)
             print_report(final)
-            return 0 if not any(f.status == "fail" for f in final) else 2
+            return 0 if not has_scored_failures(final) else 2
 
         if args.command == "fix-system-dns-display":
             dns_map = plat.get_dns_servers()

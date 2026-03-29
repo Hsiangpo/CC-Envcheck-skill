@@ -20,7 +20,7 @@ from unittest.mock import patch, MagicMock
 # Ensure scripts/ is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from scoring import WEIGHTS, compute_score, format_score_report, _grade
+from scoring import WEIGHTS, compute_score, format_score_report, _grade, has_scored_failures
 from ip_quality import (
     GOOD_IP_TYPES, BAD_IP_TYPES, US_RESIDENTIAL_ISPS,
     IANA_TIMEZONE_TO_LOCALE, parse_whois_country,
@@ -30,6 +30,8 @@ import browser_leaks as bleaks
 import browser_automation as bauto
 import browser_bootstrap as bboot
 import platform_ops as plat
+import vpn_adapter as vpnops
+import vpn_adapter as vpnops
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +130,13 @@ class TestComputeScore(unittest.TestCase):
         self.assertEqual(report.total_score, 0)
         self.assertEqual(len(report.groups), 0)  # No groups with non-zero weight
 
+    def test_has_scored_failures_ignores_zero_weight_groups(self):
+        findings = [
+            MockFinding("vpn", "unit-tests", "fail"),
+            MockFinding("vpn", "public-subscription", "fail"),
+        ]
+        self.assertFalse(has_scored_failures(findings))
+
     def test_mixed_statuses(self):
         """Mixed pass/warn/fail should compute correctly."""
         findings = [
@@ -218,6 +227,16 @@ class TestIPQualityConstants(unittest.TestCase):
     def test_hosting_vpn_in_bad_types(self):
         self.assertIn("hosting", BAD_IP_TYPES)
         self.assertIn("vpn", BAD_IP_TYPES)
+
+
+class TestVpnRootDetection(unittest.TestCase):
+    """Verify VPN root detection is explicit-only."""
+
+    def test_detect_root_returns_none_without_explicit_path_or_env(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {}, clear=True), patch("vpn_adapter.Path.home", return_value=Path(tmpdir)):
+            result = vpnops.detect_root(None)
+
+        self.assertIsNone(result)
         self.assertIn("proxy", BAD_IP_TYPES)
 
     def test_us_residential_isps_not_empty(self):
@@ -818,6 +837,14 @@ class TestExtendedInspectHelpers(unittest.TestCase):
             hits = plat.scan_ssh_known_hosts()
 
         self.assertEqual(hits, ["git.aliyun.com"])
+
+
+class TestVpnAdapterBehavior(unittest.TestCase):
+    """验证 VPN 适配器不再自动扫描本地目录。"""
+
+    def test_detect_root_requires_explicit_path_or_env(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {}, clear=True), patch("vpn_adapter.Path.home", return_value=Path(tmpdir)):
+            self.assertIsNone(vpnops.detect_root(None))
 
 
 if __name__ == "__main__":

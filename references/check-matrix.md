@@ -1,6 +1,6 @@
 # CC-Check Audit Matrix v1.3.0
 
-> 11 groups, 50+ checks, 100-point scale (exact), 80 unit tests
+> 11 groups, 50+ checks, 100-point scale (exact), 86 unit tests
 
 ## 1. IP Quality (weight: 30/100) 🔴 最高优先级
 
@@ -117,7 +117,7 @@ China mirror keywords: taobao, npmmirror, cnpm, tencent, aliyun, tuna.tsinghua, 
 
 | Key | Check | Weight | Method |
 |-----|-------|--------|--------|
-| project-root | VPN project detected | 0 | Auto-discovery |
+| project-root | VPN project detected | 0 | Explicit `--vpn-root` / env only |
 | unit-tests | VPN project tests pass | 0 | `python3 -m unittest` |
 | generated-subscription | Generated output has markers | 0 | File content scan |
 | public-subscription | Public URL matches output | 0 | URL fetch + marker check |

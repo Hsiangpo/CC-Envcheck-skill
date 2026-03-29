@@ -47,27 +47,13 @@ def load_module(path: Path, name: str, extra: Path | None = None) -> Any | None:
 
 def detect_root(explicit: str | None) -> Path | None:
     """检测可能的 VPN 项目根目录。"""
-    candidates: list[Path] = []
     if explicit:
         path = Path(explicit).expanduser()
         return path if path.exists() else None
     env_path = os.environ.get("CC_CHECK_VPN_PROJECT_ROOT")
     if env_path:
         path = Path(env_path).expanduser()
-        if path.exists():
-            candidates.append(path)
-    home = Path.home()
-    candidates.extend([home / "Develop", home / "Projects", home / "Code", home])
-    for base in candidates:
-        if base.is_file():
-            continue
-        for pattern in ("**/scripts/subscription_builder.py", "**/scripts/deploy_6node_subscription.py"):
-            try:
-                for match in base.glob(pattern):
-                    if ".git" not in match.parts:
-                        return match.parents[1]
-            except Exception:
-                continue
+        return path if path.exists() else None
     return None
 
 

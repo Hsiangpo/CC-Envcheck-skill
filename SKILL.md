@@ -13,7 +13,7 @@ Current reality:
 
 - macOS support is the most complete
 - Linux and Windows have partial inspection coverage
-- VPN project checks work only for supported project layouts, otherwise they cleanly skip
+- VPN project checks are opt-in only: use `--vpn-root` or `CC_CHECK_VPN_PROJECT_ROOT` when you explicitly want them
 
 ## ⛔ Pre-Login Requirement
 
@@ -55,6 +55,11 @@ High-risk/system-level repairs are skipped by default unless the matching `--all
 ## ⚠️ LLM Interaction Requirements
 
 Before running `fix-local` or `full`, the LLM **MUST** explain any risky flag it is about to add and get explicit consent. The CLI now enforces this boundary: risky actions are skipped unless the corresponding `--allow-*` flag is present.
+
+After `inspect`, `verify`, or `browser-leaks`, if any `fail` or `warn` items remain, the LLM **MUST**:
+1. summarize **all** remaining issues, not just the top one;
+2. clearly separate blockers from non-blockers;
+3. explicitly ask the user whether to continue with repairs before running fix commands.
 
 ### Explicit opt-in flags
 
@@ -109,6 +114,7 @@ python3 <path>/scripts/browser_bootstrap.py install --dry-run
 
 # With overrides
 python3 <path>/scripts/cc_check.py inspect \
+  --vpn-root /absolute/path/to/vpn-project \
   --target-timezone America/Los_Angeles \
   --target-locale en_US.UTF-8 \
   --proxy-url http://127.0.0.1:7897 \
@@ -129,7 +135,7 @@ The skill currently groups checks into:
 - `identity`: git identity, git remote China-host scan
 - `clash`: process, mode, TUN, runtime markers, DNS watchdog
 - `claude`: Claude settings
-- `vpn`: supported VPN project and remote deployment checks when a compatible project is detected
+- `vpn`: optional VPN project and remote deployment checks when the user explicitly provides a supported local project
 
 ## Scoring
 
@@ -221,7 +227,7 @@ Do not promise full parity across platforms unless the implementation actually h
 
 ## Browser Leak Detection
 
-The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can collect browser-side WebRTC / JavaScript runtime / browser egress IP / font / Canvas / WebGL / TLS page signals, compare browser egress with the Python baseline egress, emit a dedicated `browser_score` summary, and save a JSON evidence artifact whose path is returned as `artifact_path`. Tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing and the bootstrap helper reports local install commands plus proxy/tool diagnostics.
+The `browser-leaks` subcommand now runs **Python-level baseline checks first**, then **optionally auto-enables Playwright** when the current Node environment already has that package available. In auto mode it can collect browser-side WebRTC / JavaScript runtime / browser egress IP / font / Canvas / WebGL / TLS page signals, compare browser egress with the Python baseline egress, emit a dedicated `browser_score` summary, and save a JSON evidence artifact whose path is returned as `artifact_path`. TLS version detection now prefers real browser security details over page text when available. Tests that are not automated yet remain in the manual checklist. If Playwright is unavailable, the command cleanly falls back to the original manual checklist without failing and the bootstrap helper reports local install commands plus proxy/tool diagnostics.
 
 ## Architecture
 

@@ -100,9 +100,11 @@ python scripts/browser_bootstrap.py install --dry-run
 # browser-leaks 的 JSON 会带 browser_score 字段
 # browser_bootstrap.py status 会带 tools/proxy_env/install_commands/recommendations
 # 自动化成功时，browser-leaks JSON 还会带 artifact_path，指向本次证据文件
+# VPN 检查现在是显式启用：需要时传 --vpn-root
 
 # 自定义目标参数
 python scripts/cc_check.py inspect \
+  --vpn-root /absolute/path/to/vpn-project \
   --target-timezone America/Los_Angeles \
   --target-locale en_US.UTF-8 \
   --proxy-url http://127.0.0.1:7897 \
@@ -386,7 +388,7 @@ cc-check/
 ## 🧪 测试
 
 ```bash
-# 运行全部 80 个单元测试
+# 运行全部 86 个单元测试
 python -m unittest discover -s tests -v
 
 # CI: macOS + Linux + Windows × Python 3.10/3.11/3.12 = 9 矩阵

@@ -50,6 +50,17 @@ class TestBrowserScoring(unittest.TestCase):
         self.assertTrue(report.blocked)
         self.assertEqual(report.blocker_reasons, ["webrtc-leak: unexpected public candidate"])
 
+    def test_compute_browser_score_uses_custom_warn_penalties(self):
+        findings = [
+            bleaks.BrowserFinding("webrtc", "webrtc-leak", "warn", "proxy egress candidate"),
+            bleaks.BrowserFinding("fonts", "china-fonts", "warn", "fonts"),
+        ]
+
+        report = bscore.compute_browser_score(findings)
+
+        self.assertEqual(report.max_score, 21)
+        self.assertEqual(report.total_score, 18)
+
     def test_payload_includes_browser_score_when_automation_used(self):
         findings = [
             bleaks.BrowserFinding("webrtc", "webrtc-leak", "pass", "ok"),
@@ -121,6 +132,27 @@ class TestBrowserScoring(unittest.TestCase):
         )
 
         self.assertEqual(refined[0].status, "pass")
+
+    def test_analyze_tls_page_uses_protocol_hint_from_page_text(self):
+        findings = bleaks.analyze_tls_page({
+            "text": "TLS Handshake\nTLS Protocol\t\n0x0304\nTLS 1.3\n\nCipher Suite\t\n0x1301\nTLS_AES_128_GCM_SHA256",
+        })
+
+        self.assertEqual(findings[0].key, "tls-browser-version")
+        self.assertEqual(findings[0].status, "pass")
+        self.assertIn("TLS 1.3", findings[0].summary)
+
+    def test_analyze_tls_page_prefers_security_details(self):
+        findings = bleaks.analyze_tls_page({
+            "text": "",
+            "securityDetails": {
+                "protocol": "TLS 1.3",
+                "cipher": "AES_128_GCM",
+            },
+        })
+
+        self.assertEqual(findings[0].status, "pass")
+        self.assertIn("TLS 1.3", findings[0].summary)
 
 
 class TestBrowserBootstrapStatus(unittest.TestCase):

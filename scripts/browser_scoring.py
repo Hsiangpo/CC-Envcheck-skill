@@ -24,6 +24,11 @@ WEIGHTS: dict[str, int] = {
     "tls-browser-legacy": 4,
 }
 
+WARN_PENALTIES: dict[str, float] = {
+    "webrtc-leak": 2.0,
+    "china-fonts": 0.5,
+}
+
 BLOCKERS: set[str] = {
     "webrtc-leak",
     "webrtc-local-ip",
@@ -66,10 +71,12 @@ def _grade(pct: float) -> str:
     return "F"
 
 
-def _earned_points(status: str, weight: int) -> float:
+def _earned_points(key: str, status: str, weight: int) -> float:
     if status == "pass":
         return float(weight)
     if status == "warn":
+        if key in WARN_PENALTIES:
+            return max(float(weight) - WARN_PENALTIES[key], 0.0)
         return weight * 0.7
     if status == "skip":
         return weight * 0.5
@@ -88,7 +95,7 @@ def compute_browser_score(findings: list[Any]) -> BrowserScoreReport:
             continue
         group = getattr(finding, "test", "other")
         group_max[group] = group_max.get(group, 0) + weight
-        group_earned[group] = group_earned.get(group, 0.0) + _earned_points(getattr(finding, "status", "fail"), weight)
+        group_earned[group] = group_earned.get(group, 0.0) + _earned_points(finding.key, getattr(finding, "status", "fail"), weight)
         if finding.key in BLOCKERS and getattr(finding, "status", "") == "fail":
             blocker_reasons.append(f"{finding.key}: {getattr(finding, 'summary', '')}")
 

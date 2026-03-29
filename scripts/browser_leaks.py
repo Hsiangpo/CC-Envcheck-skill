@@ -494,14 +494,32 @@ def analyze_tls_page(data: dict[str, Any]) -> list[BrowserFinding]:
     """分析浏览器 TLS 检测页面文本。"""
     findings: list[BrowserFinding] = []
     text = str(data.get("text", "")).strip()
+    security_details = data.get("securityDetails", {}) if isinstance(data, dict) else {}
+    protocol = str(security_details.get("protocol", "")).strip()
+    cipher = str(security_details.get("cipher", "")).strip()
+    parsed_protocol = ""
+    protocol_match = re.search(r"TLS Protocol\s+0x[0-9A-Fa-f]+\s+(TLS\s+1\.[0-3])", text, re.MULTILINE)
+    if protocol_match:
+        parsed_protocol = protocol_match.group(1).strip()
     if not text:
-        return [
-            BrowserFinding("tls", "tls-browser-version", "skip", "Browser TLS page text unavailable"),
-            BrowserFinding("tls", "tls-browser-legacy", "skip", "Browser TLS legacy protocol check unavailable"),
-        ]
+        if not protocol:
+            return [
+                BrowserFinding("tls", "tls-browser-version", "skip", "Browser TLS page text unavailable"),
+                BrowserFinding("tls", "tls-browser-legacy", "skip", "Browser TLS legacy protocol check unavailable"),
+            ]
+        text = ""
 
     lower = text.lower()
-    if "tls 1.3 enabled" in lower or "tlsv1.3" in lower:
+    effective_protocol = protocol or parsed_protocol
+    if effective_protocol:
+        protocol_lower = effective_protocol.lower()
+        if "1.3" in protocol_lower:
+            findings.append(BrowserFinding("tls", "tls-browser-version", "pass", f"Browser negotiated {effective_protocol}" + (f" ({cipher})" if cipher else "")))
+        elif "1.2" in protocol_lower:
+            findings.append(BrowserFinding("tls", "tls-browser-version", "warn", f"Browser negotiated {effective_protocol}" + (f" ({cipher})" if cipher else "")))
+        else:
+            findings.append(BrowserFinding("tls", "tls-browser-version", "fail", f"Browser negotiated legacy protocol {effective_protocol}"))
+    elif "tls 1.3 enabled" in lower or "tlsv1.3" in lower:
         findings.append(BrowserFinding("tls", "tls-browser-version", "pass", "Browser TLS page reports TLS 1.3"))
     elif "tls 1.2" in lower:
         findings.append(BrowserFinding("tls", "tls-browser-version", "warn", "Browser TLS page did not confirm TLS 1.3"))
@@ -512,6 +530,8 @@ def analyze_tls_page(data: dict[str, Any]) -> list[BrowserFinding]:
     for version in ("1.0", "1.1"):
         if re.search(rf"tls\s*{re.escape(version)}\s*enabled", lower):
             legacy_hits.append(version)
+    if protocol and any(version in protocol.lower() for version in ("1.0", "1.1")):
+        legacy_hits.append(protocol)
     findings.append(BrowserFinding(
         "tls",
         "tls-browser-legacy",

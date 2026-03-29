@@ -220,9 +220,17 @@ async function collectWebGl(page) {
 }
 
 async function collectTlsPage(page) {
+  const session = await page.context().newCDPSession(page);
+  await session.send('Network.enable');
+  let securityDetails = null;
+  session.on('Network.responseReceived', (evt) => {
+    if (evt.response?.url?.includes('browserleaks.com/tls') && evt.response?.securityDetails) {
+      securityDetails = evt.response.securityDetails;
+    }
+  });
   await page.goto('https://browserleaks.com/tls', { waitUntil: 'domcontentloaded', timeout: 20000 });
   const text = await page.locator('body').innerText();
-  return { text };
+  return { text, securityDetails };
 }
 
 async function main() {
